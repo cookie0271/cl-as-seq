@@ -1,0 +1,34 @@
+batch_size: 16
+cil_core: GeMCL
+ckpt_interval: 2500
+dataset: casia
+device: cuda
+eval_batch_size: 64
+eval_interval: 1000
+eval_iters: 32
+hidden_dim: 512
+input_type: image
+log_dir: runs/casia-gemcl-w4-b16
+lr_sched: StepLR
+lr_sched_args:
+  gamma: 0.5
+  step_size: 10000
+map: false
+max_train_steps: 50000
+meta_test_tasks: 1000
+model: ClassIncrementalModel
+num_bites: 1
+num_workers: 4
+optim: Adam
+optim_args:
+  lr: 0.0001
+output_type: class
+summary_interval: 250
+tasks: 20
+test_shots: 5
+train_shots: 5
+x_c: 1
+x_encoder: CnnEncoder
+x_encoder_ckpt: null
+x_h: 32
+x_w: 32

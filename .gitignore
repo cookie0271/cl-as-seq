@@ -1,0 +1,34 @@
+# 虚拟环境
+venv/
+.venv/
+env/
+*.env
+
+# 缓存/临时文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 数据/日志/大文件
+data/
+logs/
+*.log
+*.csv
+*.xlsx
+*.zip
+*.rar
+*.tar.gz
+*.png
+*.jpg
+*.mp4
+
+# 构建/输出文件
+dist/
+build/
+*.egg-info/

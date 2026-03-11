@@ -1,0 +1,65 @@
+attn_loss: 0.0
+attn_loss_heads: 4
+attn_loss_steps: 10000
+batch_size: 8
+ckpt_interval: 200
+corr_dropout: 0.1
+corr_hidden_ratio: 0.25
+corr_zero_init: true
+dataset: omniglot
+ddp_find_unused_parameters: true
+device: cuda
+distributed_loss: false
+distributed_loss_steps: 10000
+enable_correction: false
+enable_highway_gate: false
+eval_batch_size: 8
+eval_interval: 200
+eval_iters: 4
+freeze_backbone: true
+gate_bias_init: -3.0
+gate_dropout: 0.1
+gate_hidden_ratio: 0.25
+gate_input_type: prev_z
+gate_type: mlp2
+hidden_dim: 128
+input_type: image
+lambda_rate: 0.1
+log_dir: runs/gate_multiseed_off_seed3
+lr_sched: StepLR
+lr_sched_args:
+  gamma: 0.5
+  step_size: 10000
+max_train_steps: 200
+model: ContinualTransformer
+num_bites: 1
+num_workers: 0
+optim: Adam
+optim_args:
+  lr: 0.0001
+output_type: class
+qk_dim: 512
+r_target: 0.1
+seed: 3
+summary_interval: 20
+tasks: 5
+test_shots: 1
+tf_attn: elu
+tf_dropout: 0.1
+tf_ff_dim: 256
+tf_heads: 4
+tf_layers: 1
+tf_ln: false
+train_correction: true
+train_gate: true
+train_head: true
+train_shots: 1
+use_prev_state_in_corr: false
+v_dim: 512
+x_c: 1
+x_encoder: CnnEncoder
+x_encoder_ckpt: null
+x_h: 32
+x_w: 32
+y_len: 1
+y_vocab: 5

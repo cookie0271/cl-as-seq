@@ -1,0 +1,50 @@
+include: cfg/model/base.yaml
+
+model: ContinualTransformer
+
+# Class representation
+y_vocab: null
+y_len: 1
+
+# ContinualTransformer
+tf_attn: vanilla  # vanilla or elu (Linear Transformer) or favor (Performer)
+tf_layers: 4
+tf_heads: 8
+tf_ff_dim: 1024
+tf_dropout: 0.1
+tf_ln: False
+qk_dim: 64
+v_dim: 64
+attn_loss: 1.0
+attn_loss_heads: 4
+attn_loss_steps: 10000
+distributed_loss: False
+distributed_loss_steps: 10000
+
+# Post-backbone refinement + highway write gate
+enable_correction: True
+enable_highway_gate: True
+corr_hidden_ratio: 0.25
+corr_dropout: 0.1
+corr_zero_init: True
+use_prev_state_in_corr: False
+
+gate_type: mlp2
+gate_hidden_ratio: 0.25
+gate_dropout: 0.1
+gate_bias_init: -3.0
+gate_input_type: prev_z
+
+lambda_rate: 0.1
+r_target: 0.1
+
+freeze_backbone: True
+train_correction: True
+train_gate: True
+train_head: True
+
+# Reproducibility
+seed: 0
+
+# DDP behavior
+ddp_find_unused_parameters: True
