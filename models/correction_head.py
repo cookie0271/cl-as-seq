@@ -15,7 +15,7 @@ class CorrectionHead(nn.Module):
         in_dim = hidden_dim * (3 if use_prev_state_in_corr else 2)
         corr_hidden_dim = max(int(hidden_dim * corr_hidden_ratio), 16)
 
-        self.prev_ln = nn.LayerNorm(hidden_dim)
+        self.prev_ln = nn.LayerNorm(hidden_dim) if use_prev_state_in_corr else nn.Identity()
         self.u_ln = nn.LayerNorm(hidden_dim)
         self.z_ln = nn.LayerNorm(hidden_dim)
         self.fc1 = nn.Linear(in_dim, corr_hidden_dim)

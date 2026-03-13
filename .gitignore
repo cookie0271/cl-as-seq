@@ -31,4 +31,6 @@ logs/
 # 构建/输出文件
 dist/
 build/
+runs/
+analysis_outputs/
 *.egg-info/

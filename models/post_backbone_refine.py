@@ -50,7 +50,7 @@ class PostBackboneRefineAndGate(nn.Module):
     def _from_bld(x, layout):
         return x if layout == 'BLD' else x.transpose(0, 1)
 
-    def forward(self, u_hidden, z_hidden, valid_mask=None, input_layout='BLD'):
+    def forward(self, u_hidden, z_hidden, valid_mask=None, input_layout='BLD', collect_analysis=False, train_len=None):
         u_bld, layout = self._to_bld(u_hidden, input_layout=input_layout)
         z_bld, _ = self._to_bld(z_hidden, input_layout=input_layout)
 
@@ -62,6 +62,31 @@ class PostBackboneRefineAndGate(nn.Module):
                 'base_hidden': u_bld,
                 'refined_hidden': u_bld,
             }
+            if collect_analysis:
+                batch, seq_len, _ = u_bld.shape
+                device = u_bld.device
+                token_idx = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch, -1)
+                if train_len is None:
+                    is_train_segment = torch.zeros(batch, seq_len, device=device, dtype=torch.bool)
+                else:
+                    is_train_segment = token_idx < train_len
+                analysis = {
+                    'gate_value': torch.full((batch, seq_len), float('nan'), device=device),
+                    'gate_pre_sigmoid': torch.full((batch, seq_len), float('nan'), device=device),
+                    'delta_norm': torch.zeros(batch, seq_len, device=device),
+                    'cand_minus_u_norm': torch.zeros(batch, seq_len, device=device),
+                    'h_minus_prev_norm': torch.zeros(batch, seq_len, device=device),
+                    'u_norm': u_bld.norm(dim=-1),
+                    'cand_norm': u_bld.norm(dim=-1),
+                    'h_norm': u_bld.norm(dim=-1),
+                    'prev_norm': torch.zeros(batch, seq_len, device=device),
+                    'is_train_segment': is_train_segment,
+                    'is_test_segment': ~is_train_segment,
+                    'is_valid_token': torch.ones(batch, seq_len, device=device, dtype=torch.bool)
+                    if valid_mask is None else valid_mask.bool(),
+                    'time_index': token_idx,
+                }
+                aux['analysis'] = analysis
             return u_hidden, aux
 
         batch, seq_len, hidden_dim = u_bld.shape
@@ -74,15 +99,33 @@ class PostBackboneRefineAndGate(nn.Module):
             prev = self.h0.unsqueeze(0).expand(batch, -1)
 
         deltas, cands, gates, refined = [], [], [], []
+        gate_logits = []
+        delta_norms, cand_minus_u_norms, h_minus_prev_norms = [], [], []
+        u_norms, cand_norms, h_norms, prev_norms = [], [], [], []
 
         if self.enable_correction and not self.enable_highway_gate:
             prev_corr = prev
             for t in range(seq_len):
-                delta_t = self.correction(u_bld[:, t], z_bld[:, t], prev=prev_corr)
-                cand_t = u_bld[:, t] + delta_t
+                prev_t = prev_corr
+                u_t = u_bld[:, t]
+                z_t = z_bld[:, t]
+                delta_t = self.correction(u_t, z_t, prev=prev_corr)
+                cand_t = u_t + delta_t
+                h_t = cand_t
+
                 deltas.append(delta_t)
                 cands.append(cand_t)
                 refined.append(cand_t)
+
+                if collect_analysis:
+                    delta_norms.append(delta_t.norm(dim=-1))
+                    cand_minus_u_norms.append((cand_t - u_t).norm(dim=-1))
+                    h_minus_prev_norms.append((h_t - prev_t).norm(dim=-1))
+                    u_norms.append(u_t.norm(dim=-1))
+                    cand_norms.append(cand_t.norm(dim=-1))
+                    h_norms.append(h_t.norm(dim=-1))
+                    prev_norms.append(prev_t.norm(dim=-1))
+
                 prev_corr = cand_t
             h_bld = torch.stack(refined, dim=1)
             delta_bld = torch.stack(deltas, dim=1)
@@ -94,9 +137,29 @@ class PostBackboneRefineAndGate(nn.Module):
                 'base_hidden': u_bld,
                 'refined_hidden': h_bld,
             }
+            if collect_analysis:
+                token_idx = torch.arange(seq_len, device=u_bld.device).unsqueeze(0).expand(batch, -1)
+                is_train_segment = token_idx < train_len if train_len is not None else torch.zeros_like(token_idx).bool()
+                aux['analysis'] = {
+                    'gate_value': torch.full((batch, seq_len), float('nan'), device=u_bld.device),
+                    'gate_pre_sigmoid': torch.full((batch, seq_len), float('nan'), device=u_bld.device),
+                    'delta_norm': torch.stack(delta_norms, dim=1),
+                    'cand_minus_u_norm': torch.stack(cand_minus_u_norms, dim=1),
+                    'h_minus_prev_norm': torch.stack(h_minus_prev_norms, dim=1),
+                    'u_norm': torch.stack(u_norms, dim=1),
+                    'cand_norm': torch.stack(cand_norms, dim=1),
+                    'h_norm': torch.stack(h_norms, dim=1),
+                    'prev_norm': torch.stack(prev_norms, dim=1),
+                    'is_train_segment': is_train_segment,
+                    'is_test_segment': ~is_train_segment,
+                    'is_valid_token': torch.ones(batch, seq_len, device=u_bld.device, dtype=torch.bool)
+                    if valid_mask is None else valid_mask.bool(),
+                    'time_index': token_idx,
+                }
             return self._from_bld(h_bld, layout), aux
 
         for t in range(seq_len):
+            prev_t = prev
             u_t = u_bld[:, t]
             z_t = z_bld[:, t]
 
@@ -107,18 +170,36 @@ class PostBackboneRefineAndGate(nn.Module):
                 delta_t = torch.zeros_like(u_t)
                 cand_t = u_t
 
-            g_t = self.gate(prev, z_t, cand_t=cand_t)
+            if collect_analysis:
+                g_t, gate_logits_t = self.gate(prev, z_t, cand_t=cand_t, return_logits=True)
+            else:
+                g_t = self.gate(prev, z_t, cand_t=cand_t)
+                gate_logits_t = None
             h_t = (1 - g_t) * prev + g_t * cand_t
 
             if valid_mask is not None:
                 valid_t = valid_mask[:, t].unsqueeze(-1).to(dtype=h_t.dtype)
                 h_t = valid_t * h_t + (1 - valid_t) * prev
                 g_t = g_t * valid_t
+                if gate_logits_t is not None:
+                    gate_logits_t = gate_logits_t * valid_t
 
             deltas.append(delta_t)
             cands.append(cand_t)
             gates.append(g_t)
             refined.append(h_t)
+            if gate_logits_t is not None:
+                gate_logits.append(gate_logits_t)
+
+            if collect_analysis:
+                delta_norms.append(delta_t.norm(dim=-1))
+                cand_minus_u_norms.append((cand_t - u_t).norm(dim=-1))
+                h_minus_prev_norms.append((h_t - prev_t).norm(dim=-1))
+                u_norms.append(u_t.norm(dim=-1))
+                cand_norms.append(cand_t.norm(dim=-1))
+                h_norms.append(h_t.norm(dim=-1))
+                prev_norms.append(prev_t.norm(dim=-1))
+
             prev = h_t
 
         h_bld = torch.stack(refined, dim=1)
@@ -129,6 +210,25 @@ class PostBackboneRefineAndGate(nn.Module):
             'base_hidden': u_bld,
             'refined_hidden': h_bld,
         }
+        if collect_analysis:
+            token_idx = torch.arange(seq_len, device=u_bld.device).unsqueeze(0).expand(batch, -1)
+            is_train_segment = token_idx < train_len if train_len is not None else torch.zeros_like(token_idx).bool()
+            aux['analysis'] = {
+                'gate_value': aux['gates'].squeeze(-1),
+                'gate_pre_sigmoid': torch.stack(gate_logits, dim=1).squeeze(-1) if len(gate_logits) > 0 else None,
+                'delta_norm': torch.stack(delta_norms, dim=1),
+                'cand_minus_u_norm': torch.stack(cand_minus_u_norms, dim=1),
+                'h_minus_prev_norm': torch.stack(h_minus_prev_norms, dim=1),
+                'u_norm': torch.stack(u_norms, dim=1),
+                'cand_norm': torch.stack(cand_norms, dim=1),
+                'h_norm': torch.stack(h_norms, dim=1),
+                'prev_norm': torch.stack(prev_norms, dim=1),
+                'is_train_segment': is_train_segment,
+                'is_test_segment': ~is_train_segment,
+                'is_valid_token': torch.ones(batch, seq_len, device=u_bld.device, dtype=torch.bool)
+                if valid_mask is None else valid_mask.bool(),
+                'time_index': token_idx,
+            }
         return self._from_bld(h_bld, layout), aux
 
 

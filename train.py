@@ -1,4 +1,5 @@
 import os
+import csv
 import os.path as path
 import shutil
 import socket
@@ -69,6 +70,123 @@ def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+
+def _to_item(x):
+    if x is None:
+        return ''
+    if isinstance(x, torch.Tensor):
+        if x.numel() == 0:
+            return ''
+        return x.item()
+    return x
+
+
+def export_analysis_table(output, config, split, batch_id, batch_pos_in_run, sample_offset=0):
+    analysis = output.get('analysis')
+    if analysis is None:
+        return None
+
+    analysis_cfg = config.get('analysis_export', {})
+    out_root = analysis_cfg.get('output_dir', 'analysis_outputs')
+    run_name = path.basename(path.normpath(config['log_dir']))
+    out_dir = path.join(out_root, run_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    analysis_cpu = {}
+    for key, value in analysis.items():
+        if isinstance(value, torch.Tensor):
+            analysis_cpu[key] = value.detach().cpu()
+        else:
+            analysis_cpu[key] = value
+
+    gate_value = analysis_cpu.get('gate_value')
+    delta_norm = analysis_cpu.get('delta_norm')
+    cand_minus_u_norm = analysis_cpu.get('cand_minus_u_norm')
+    h_minus_prev_norm = analysis_cpu.get('h_minus_prev_norm')
+    bsz, seq_len = delta_norm.shape
+
+    csv_path = path.join(out_dir, f'split_{split}_batch{batch_id:03d}_part{sample_offset:03d}.csv')
+    fieldnames = [
+        'batch_id', 'batch_pos_in_run', 'sample_index_in_batch', 'time_index',
+        'is_valid_token', 'is_train_segment', 'is_test_segment', 'segment_id',
+        'label', 'predicted_label',
+        'gate_value', 'delta_norm', 'cand_minus_u_norm', 'h_minus_prev_norm',
+        'u_norm', 'cand_norm', 'h_norm', 'prev_norm', 'gate_pre_sigmoid',
+        'loss_token', 'correctness',
+    ]
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for b in range(bsz):
+            for t in range(seq_len):
+                is_train = bool(analysis_cpu['is_train_segment'][b, t].item()) if 'is_train_segment' in analysis_cpu else False
+                row = {
+                    'batch_id': batch_id,
+                    'batch_pos_in_run': batch_pos_in_run,
+                    'sample_index_in_batch': sample_offset + b,
+                    'time_index': t,
+                    'is_valid_token': int(analysis_cpu['is_valid_token'][b, t].item()) if 'is_valid_token' in analysis_cpu else 1,
+                    'is_train_segment': int(is_train),
+                    'is_test_segment': int(not is_train),
+                    'segment_id': 0 if is_train else 1,
+                    'label': '',
+                    'predicted_label': '',
+                    'gate_value': _to_item(gate_value[b, t]) if gate_value is not None else '',
+                    'delta_norm': _to_item(delta_norm[b, t]),
+                    'cand_minus_u_norm': _to_item(cand_minus_u_norm[b, t]),
+                    'h_minus_prev_norm': _to_item(h_minus_prev_norm[b, t]),
+                    'u_norm': _to_item(analysis_cpu.get('u_norm')[b, t]) if analysis_cpu.get('u_norm') is not None else '',
+                    'cand_norm': _to_item(analysis_cpu.get('cand_norm')[b, t]) if analysis_cpu.get('cand_norm') is not None else '',
+                    'h_norm': _to_item(analysis_cpu.get('h_norm')[b, t]) if analysis_cpu.get('h_norm') is not None else '',
+                    'prev_norm': _to_item(analysis_cpu.get('prev_norm')[b, t]) if analysis_cpu.get('prev_norm') is not None else '',
+                    'gate_pre_sigmoid': _to_item(analysis_cpu.get('gate_pre_sigmoid')[b, t]) if analysis_cpu.get('gate_pre_sigmoid') is not None else '',
+                    'loss_token': '',
+                    'correctness': '',
+                }
+                writer.writerow(row)
+
+    valid = analysis_cpu['is_valid_token'].bool() if 'is_valid_token' in analysis_cpu else torch.ones_like(delta_norm).bool()
+    is_train_mask = analysis_cpu['is_train_segment'].bool() if 'is_train_segment' in analysis_cpu else torch.zeros_like(valid)
+    is_test_mask = ~is_train_mask
+
+    def _masked_mean(x, mask):
+        if x is None:
+            return float('nan')
+        m = mask & torch.isfinite(x)
+        if m.any():
+            return x[m].mean().item()
+        return float('nan')
+
+    summary = {
+        'batch_id': batch_id,
+        'split': split,
+        'mean_gate': _masked_mean(gate_value, valid),
+        'std_gate': float(gate_value[valid & torch.isfinite(gate_value)].std(unbiased=False).item()) if gate_value is not None and (valid & torch.isfinite(gate_value)).any() else float('nan'),
+        'min_gate': float(gate_value[valid & torch.isfinite(gate_value)].min().item()) if gate_value is not None and (valid & torch.isfinite(gate_value)).any() else float('nan'),
+        'max_gate': float(gate_value[valid & torch.isfinite(gate_value)].max().item()) if gate_value is not None and (valid & torch.isfinite(gate_value)).any() else float('nan'),
+        'mean_delta_norm': _masked_mean(delta_norm, valid),
+        'mean_cand_minus_u_norm': _masked_mean(cand_minus_u_norm, valid),
+        'mean_h_minus_prev_norm': _masked_mean(h_minus_prev_norm, valid),
+        'mean_u_norm': _masked_mean(analysis_cpu.get('u_norm'), valid),
+        'mean_h_norm': _masked_mean(analysis_cpu.get('h_norm'), valid),
+        'mean_gate_train': _masked_mean(gate_value, valid & is_train_mask),
+        'mean_gate_test': _masked_mean(gate_value, valid & is_test_mask),
+        'mean_delta_norm_train': _masked_mean(delta_norm, valid & is_train_mask),
+        'mean_delta_norm_test': _masked_mean(delta_norm, valid & is_test_mask),
+    }
+
+    summary_path = path.join(out_dir, 'summary.csv')
+    summary_fields = list(summary.keys())
+    write_header = not path.exists(summary_path)
+    with open(summary_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=summary_fields)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(summary)
+
+    return csv_path, summary_path
 
 def main():
     if torch.cuda.is_available():
@@ -225,6 +343,7 @@ def train(rank, world_size, port, args, config, distributed=True):
     start_time = datetime.now()
     print(f'Training started at {start_time}')
     eval_num_bites = 1
+    analysis_exported_batches = 0
     for step in range(start_step + 1, config['max_train_steps'] + 1):
         train_x, train_y, test_x, test_y = next(train_loader_iter)
 
@@ -374,7 +493,7 @@ def train(rank, world_size, port, args, config, distributed=True):
                 loss_mean = 0
                 correct, total = 0, 0
                 eval_size = config['eval_iters'] * config['eval_batch_size']
-                for _ in range(config['eval_iters']):
+                for eval_batch_idx in range(config['eval_iters']):
                     train_x, train_y, test_x, test_y = next(test_loader_iter)
                     train_x, train_y = train_x.to(device), train_y.to(device)
                     test_x, test_y = test_x.to(device), test_y.to(device)
@@ -409,6 +528,23 @@ def train(rank, world_size, port, args, config, distributed=True):
                         if 'correct' in output:
                             correct += output['correct']
                             total += output['total']
+
+                        analysis_cfg = config.get('analysis_export', {})
+                        if rank == 0 and analysis_cfg.get('enable', False):
+                            max_batches = analysis_cfg.get('max_batches', 10)
+                            if analysis_exported_batches < max_batches and eval_batch_idx < max_batches:
+                                export_paths = export_analysis_table(
+                                    output,
+                                    config,
+                                    split='val',
+                                    batch_id=analysis_exported_batches,
+                                    batch_pos_in_run=eval_batch_idx,
+                                    sample_offset=digested - bite,
+                                )
+                                if export_paths is not None and (digested - bite) == 0:
+                                    print(f'\n[analysis_export] wrote {export_paths[0]}')
+                                if batch_size - digested == 0:
+                                    analysis_exported_batches += 1
 
                 if distributed:
                     gathered_loss_mean = torch.zeros(world_size, dtype=loss_mean.dtype, device=loss_mean.device)
@@ -527,6 +663,8 @@ def forward(model, train_x, train_y, test_x, test_y, eval_size):
     if 'evaluation' in output:
         eval_output['correct'] = output['evaluation'].sum()
         eval_output['total'] = torch.tensor(output['evaluation'].numel(), device=eval_output['correct'].device)
+    if 'analysis' in output:
+        eval_output['analysis'] = output['analysis']
 
     return eval_output
 

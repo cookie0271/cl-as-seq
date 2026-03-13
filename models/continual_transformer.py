@@ -423,7 +423,15 @@ class ContinualTransformer(Model):
         xy_enc, _ = pack([train_xy_enc, test_xy_enc], 'b * h')
         train_len = train_num * (1 + y_len)
         hidden, aux_outputs = self.forward_tf(xy_enc, attach_test_after, train_len=train_len)
-        refined_hidden, refine_aux = self.post_backbone_refine(hidden, xy_enc, input_layout='BLD')
+        analysis_cfg = self.config.get('analysis_export', {})
+        collect_analysis = evaluate and analysis_cfg.get('enable', False)
+        refined_hidden, refine_aux = self.post_backbone_refine(
+            hidden,
+            xy_enc,
+            input_layout='BLD',
+            collect_analysis=collect_analysis,
+            train_len=train_len,
+        )
         hidden_for_output = refined_hidden
 
         test_hidden = hidden_for_output[:, train_len:]
@@ -460,6 +468,8 @@ class ContinualTransformer(Model):
             if gates is not None:
                 mean_gate = gates.mean()
                 output['gate_rate_loss'] = (mean_gate - self.config.get('r_target', 0.1)) ** 2
+            if collect_analysis and 'analysis' in refine_aux:
+                output['analysis'] = refine_aux['analysis']
 
         # Compute attention loss
         if self.config['attn_loss'] > 0:

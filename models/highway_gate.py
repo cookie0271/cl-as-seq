@@ -26,8 +26,8 @@ class HighwayScalarGate(nn.Module):
 
         in_dim = hidden_dim * in_mult
         self.prev_ln = nn.LayerNorm(hidden_dim)
-        self.z_ln = nn.LayerNorm(hidden_dim)
-        self.cand_ln = nn.LayerNorm(hidden_dim)
+        self.z_ln = nn.LayerNorm(hidden_dim) if gate_input_type in {'prev_z', 'prev_z_cand'} else nn.Identity()
+        self.cand_ln = nn.LayerNorm(hidden_dim) if gate_input_type in {'prev_cand', 'prev_z_cand'} else nn.Identity()
 
         if gate_type == 'mlp2':
             gate_hidden_dim = max(int(hidden_dim * gate_hidden_ratio), 16)
@@ -44,7 +44,7 @@ class HighwayScalarGate(nn.Module):
         else:
             raise ValueError(f'Unknown gate_type: {gate_type}')
 
-    def forward(self, prev, z_t, cand_t=None):
+    def forward(self, prev, z_t, cand_t=None, return_logits=False):
         prev_ln = self.prev_ln(prev)
         z_ln = self.z_ln(z_t)
 
@@ -61,4 +61,8 @@ class HighwayScalarGate(nn.Module):
         else:
             raise ValueError(f'Unknown gate_input_type: {self.gate_input_type}')
 
-        return torch.sigmoid(self.net(gate_inp))
+        gate_logits = self.net(gate_inp)
+        gate = torch.sigmoid(gate_logits)
+        if return_logits:
+            return gate, gate_logits
+        return gate

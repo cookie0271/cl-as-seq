@@ -48,3 +48,11 @@ seed: 0
 
 # DDP behavior
 ddp_find_unused_parameters: True
+
+analysis_export:
+  enable: False
+  output_dir: analysis_outputs
+  max_batches: 10
+  save_per_step: True
+  file_format: csv
+  include_hidden_stats: True
