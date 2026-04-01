@@ -51,19 +51,32 @@ def get_config(config_path):
     return config
 
 def load_state_dict_flexible(model, state_dict):
-    try:
-        model.load_state_dict(state_dict)
-        return
-    except RuntimeError:
-        pass
-
+    candidates = [state_dict]
     if any(k.startswith('module.') for k in state_dict):
-        stripped = {k[len('module.'):]: v for k, v in state_dict.items()}
-        model.load_state_dict(stripped)
+        candidates.append({k[len('module.'):]: v for k, v in state_dict.items()})
     else:
-        prefixed = {f'module.{k}': v for k, v in state_dict.items()}
-        model.load_state_dict(prefixed)
+        candidates.append({f'module.{k}': v for k, v in state_dict.items()})
 
+    for candidate in candidates:
+        try:
+            model.load_state_dict(candidate)
+            return
+        except RuntimeError:
+            continue
+
+        # Allow warm-starting from checkpoints without newly-added modules
+        # (e.g., loading no-correction/no-gate baseline into correction/gate variants).
+        # Allow warm-starting from checkpoints without newly-added modules
+        # (e.g., loading no-correction/no-gate baseline into correction/gate variants).
+        model_keys = set(model.state_dict().keys())
+        best_candidate = max(candidates, key=lambda cand: len(model_keys.intersection(cand.keys())))
+        missing, unexpected = model.load_state_dict(best_candidate, strict=False)
+        if len(missing) > 0:
+            print(f'Warning: missing keys during checkpoint load ({len(missing)}). '
+                  f'New parameters keep their default initialization.')
+        if len(unexpected) > 0:
+            print(f'Warning: unexpected keys during checkpoint load ({len(unexpected)}). '
+                  f'They are ignored.')
 
 
 def set_seed(seed):
@@ -298,6 +311,9 @@ def train(rank, world_size, port, args, config, distributed=True):
         train_corr=config.get('train_correction', True),
         train_gate=config.get('train_gate', True),
         train_head=config.get('train_head', True),
+        partial_freeze_mode=config.get('partial_freeze_mode', 'none'),
+        train_last_tf_layers=config.get('train_last_tf_layers', 0),
+        freeze_encoder=config.get('freeze_encoder', False),
     )
     if distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -317,8 +333,22 @@ def train(rank, world_size, port, args, config, distributed=True):
             ckpt_path = ckpt_paths[-1]
             ckpt = torch.load(ckpt_path)
             load_state_dict_flexible(model, ckpt['model'])
-            optim.load_state_dict(ckpt['optim'])
-            lr_sched.load_state_dict(ckpt['lr_sched'])
+            optim_loaded = False
+            if 'optim' in ckpt:
+                try:
+                    optim.load_state_dict(ckpt['optim'])
+                    optim_loaded = True
+                except ValueError as e:
+                    print(f'Warning: optimizer state incompatible with current trainable parameter groups. '
+                          f'Using freshly initialized optimizer. ({e})')
+            if 'lr_sched' in ckpt:
+                if optim_loaded:
+                    try:
+                        lr_sched.load_state_dict(ckpt['lr_sched'])
+                    except ValueError as e:
+                        print(f'Warning: lr scheduler state incompatible; using fresh scheduler. ({e})')
+                else:
+                    print('Warning: skipping lr scheduler state load because optimizer state was not restored.')
             # Get step number from checkpoint name
             start_step = int(path.basename(ckpt_path).split('-')[1].split('.')[0])
             print(f'Checkpoint loaded from {ckpt_path}')

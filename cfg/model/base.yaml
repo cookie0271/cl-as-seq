@@ -24,3 +24,11 @@ lr_sched_args:
 summary_interval: 250
 eval_interval: 1000
 ckpt_interval: 2500
+
+seed: 0
+
+# Optional analysis export controls
+analysis_export:
+  enable: False
+  max_batches: 0
+  output_dir: analysis_outputs

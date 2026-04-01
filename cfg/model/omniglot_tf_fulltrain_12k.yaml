@@ -1,0 +1,10 @@
+include: cfg/model/omniglot_tf_pure_baseline.yaml
+
+# Full-train 12K ablation base (Omniglot 20-way 5-shot 1-test-shot)
+# Transformer backbone kept identical to layer-1 baseline.
+max_train_steps: 12000
+batch_size: 256
+eval_batch_size: 64
+
+# Keep attention-loss behavior consistent with layer-1 baseline via tf.yaml include:
+# attn_loss=1.0, attn_loss_steps=10000

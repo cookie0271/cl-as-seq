@@ -295,7 +295,10 @@ class ContinualTransformer(Model):
             train_backbone=False,
             train_corr=True,
             train_gate=True,
-            train_head=True):
+            train_head=True,
+            partial_freeze_mode='none',
+            train_last_tf_layers=0,
+            freeze_encoder=False):
         backbone_modules = [self.x_encoder, self.y_encoder, self.pos_enc, self.tf_layers]
         if hasattr(self, 'x_proj'):
             backbone_modules.append(self.x_proj)
@@ -316,6 +319,36 @@ class ContinualTransformer(Model):
             for param in module.parameters():
                 param.requires_grad = train_head
 
+        # Optional finer-grained partial-freeze controls.
+        # Existing train_backbone behavior remains default when partial_freeze_mode is 'none'.
+        if partial_freeze_mode != 'none':
+            # Encoder freeze control (CNN/MLP encoder + projection).
+            if freeze_encoder:
+                for param in self.x_encoder.parameters():
+                    param.requires_grad = False
+                if hasattr(self, 'x_proj'):
+                    for param in self.x_proj.parameters():
+                        param.requires_grad = False
+
+            if partial_freeze_mode == 'last_n_tf':
+                # Freeze all TF layers first, then unfreeze only last N.
+                for layer in self.tf_layers:
+                    for param in layer.parameters():
+                        param.requires_grad = False
+
+                n = int(train_last_tf_layers) if train_last_tf_layers is not None else 0
+                n = max(0, min(n, len(self.tf_layers)))
+                if n > 0:
+                    for layer in self.tf_layers[-n:]:
+                        for param in layer.parameters():
+                            param.requires_grad = True
+            elif partial_freeze_mode == 'tf_all':
+                for layer in self.tf_layers:
+                    for param in layer.parameters():
+                        param.requires_grad = True
+            else:
+                raise ValueError(f'Unknown partial_freeze_mode: {partial_freeze_mode}')
+
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         module_status = {
@@ -323,6 +356,9 @@ class ContinualTransformer(Model):
             'correction': train_corr and self.post_backbone_refine.correction is not None,
             'gate': train_gate and self.post_backbone_refine.gate is not None,
             'head': train_head,
+            'partial_freeze_mode': partial_freeze_mode,
+            'train_last_tf_layers': train_last_tf_layers,
+            'freeze_encoder': freeze_encoder,
         }
         print(
             'Trainable modules: '

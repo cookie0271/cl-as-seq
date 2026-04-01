@@ -27,7 +27,7 @@ EVAL_ITERS_TRAIN=${EVAL_ITERS_TRAIN:-5}
 EVAL_ITERS_SCORE=${EVAL_ITERS_SCORE:-5}
 BATCH_SIZE=${BATCH_SIZE:-8}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-8}
-NUM_WORKERS=${NUM_WORKERS:-0}
+NUM_WORKERS=${NUM_WORKERS:-16}
 SEEDS=${SEEDS:-"0 1 2"}
 GATE_BIASES=${GATE_BIASES:-"-3.0 -2.5 -2.0 -1.0"}
 
@@ -59,6 +59,12 @@ run_pair () {
     -dc "${DATA_CONFIG}" \
     -l "${log_dir}" \
     -o "${SCORE_COMMON}|seed=${seed}|${extra}"
+
+    # Refresh CSV incrementally so finished runs are recorded even if the sweep
+  # is interrupted by time limits (e.g., during long ANML training).
+  python collect_gate_bias_results.py \
+    --run-root "${RUN_ROOT}" \
+    --output "${RESULTS_CSV}"
 }
 
 for seed in ${SEEDS}; do

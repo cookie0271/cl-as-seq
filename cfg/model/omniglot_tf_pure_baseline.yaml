@@ -1,0 +1,24 @@
+include: cfg/model/tf.yaml
+
+# Pure Transformer baseline for Omniglot convergence sanity check
+# Keep correction/gate paths explicitly disabled.
+tf_layers: 4
+tf_heads: 8
+hidden_dim: 512
+qk_dim: 64
+v_dim: 64
+tf_ff_dim: 1024
+
+enable_correction: False
+enable_highway_gate: False
+train_correction: False
+train_gate: False
+freeze_backbone: False
+
+# Meta-training setup
+batch_size: 256
+eval_batch_size: 64
+max_train_steps: 50000
+
+# Attention loss from tf.yaml is reused:
+#   attn_loss=1.0, attn_loss_steps=10000

@@ -33,4 +33,5 @@ dist/
 build/
 runs/
 analysis_outputs/
+results/
 *.egg-info/
