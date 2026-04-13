@@ -93,8 +93,17 @@ def main():
 
     if 'y_vocab' in config and config['y_vocab'] is None:
         config['y_vocab'] = config['tasks']
+    # Robustness: tolerate numeric hyperparameters passed as strings via overrides.
+    if 'optim_args' in config and isinstance(config['optim_args'], dict):
+        lr_val = config['optim_args'].get('lr', None)
+        if isinstance(lr_val, str):
+            try:
+                config['optim_args']['lr'] = float(lr_val)
+            except ValueError:
+                pass
 
     set_seed(config.get('seed', 0))
+
 
     # Prevent overwriting
     config['log_dir'] = args.log_dir

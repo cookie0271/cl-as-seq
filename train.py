@@ -228,8 +228,20 @@ def main():
 
     if 'y_vocab' in config and config['y_vocab'] is None:
         config['y_vocab'] = config['tasks']
+    # Robustness: tolerate numeric hyperparameters passed as strings via overrides.
+    # Some shells / sweep scripts may materialize values like "1e-4" as strings.
+    if 'optim_args' in config and isinstance(config['optim_args'], dict):
+        lr_val = config['optim_args'].get('lr', None)
+        if isinstance(lr_val, str):
+            try:
+                config['optim_args']['lr'] = float(lr_val)
+            except ValueError:
+                pass
 
     set_seed(config.get('seed', 0))
+
+    if 'cudnn_benchmark' in config:
+        torch.backends.cudnn.benchmark = bool(config['cudnn_benchmark'])
 
     # Prevent overwriting
     config['log_dir'] = args.log_dir
@@ -358,16 +370,29 @@ def train(rank, world_size, port, args, config, distributed=True):
     Dataset = DATASET[config['dataset']]
     train_set = Dataset(config, root='./data', meta_split='train')
     test_set = Dataset(config, root='./data', meta_split='test')
+    num_workers = int(config.get('num_workers', 0))
+    pin_memory = bool(config.get('dataloader_pin_memory', True))
+    persistent_workers = bool(config.get('dataloader_persistent_workers', True)) and num_workers > 0
+    prefetch_factor = config.get('dataloader_prefetch_factor', None)
+
+    dataloader_kwargs = {
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+        'persistent_workers': persistent_workers,
+    }
+    if num_workers > 0 and prefetch_factor is not None:
+        dataloader_kwargs['prefetch_factor'] = int(prefetch_factor)
     train_loader = DataLoader(
         train_set,
         batch_size=config['batch_size'],
-        num_workers=config['num_workers'])
+        **dataloader_kwargs)
     test_loader = DataLoader(
         test_set,
         batch_size=config['eval_batch_size'],
-        num_workers=config['num_workers'])
+        **dataloader_kwargs)
     train_loader_iter = iter(train_loader)
     test_loader_iter = iter(test_loader)
+    transfer_non_blocking = bool(config.get('transfer_non_blocking', True))
 
     # Main training loop
     start_time = datetime.now()
@@ -383,10 +408,10 @@ def train(rank, world_size, port, args, config, distributed=True):
         while batch_size - digested > 0:
             # Gradient accumulation
             bite = min(batch_size - digested, math.ceil(config['batch_size'] / config['num_bites']))
-            train_x_bite = train_x[digested:digested + bite].to(rank)
-            train_y_bite = train_y[digested:digested + bite].to(rank)
-            test_x_bite = test_x[digested:digested + bite].to(rank)
-            test_y_bite = test_y[digested:digested + bite].to(rank)
+            train_x_bite = train_x[digested:digested + bite].to(rank, non_blocking=transfer_non_blocking)
+            train_y_bite = train_y[digested:digested + bite].to(rank, non_blocking=transfer_non_blocking)
+            test_x_bite = test_x[digested:digested + bite].to(rank, non_blocking=transfer_non_blocking)
+            test_y_bite = test_y[digested:digested + bite].to(rank, non_blocking=transfer_non_blocking)
             if batch_size - digested - bite == 0:
                 # Last bite
                 output = forward_backward(
@@ -525,17 +550,18 @@ def train(rank, world_size, port, args, config, distributed=True):
                 eval_size = config['eval_iters'] * config['eval_batch_size']
                 for eval_batch_idx in range(config['eval_iters']):
                     train_x, train_y, test_x, test_y = next(test_loader_iter)
-                    train_x, train_y = train_x.to(device), train_y.to(device)
-                    test_x, test_y = test_x.to(device), test_y.to(device)
-
+                    train_x = train_x.to(device, non_blocking=transfer_non_blocking)
+                    train_y = train_y.to(device, non_blocking=transfer_non_blocking)
+                    test_x = test_x.to(device, non_blocking=transfer_non_blocking)
+                    test_y = test_y.to(device, non_blocking=transfer_non_blocking)
                     batch_size = train_x.shape[0]
                     digested = 0
                     while batch_size - digested > 0:
                         bite = min(batch_size - digested, math.ceil(config['eval_batch_size'] / config['num_bites']))
-                        train_x_bite = train_x[digested:digested + bite].to(rank)
-                        train_y_bite = train_y[digested:digested + bite].to(rank)
-                        test_x_bite = test_x[digested:digested + bite].to(rank)
-                        test_y_bite = test_y[digested:digested + bite].to(rank)
+                        train_x_bite = train_x[digested:digested + bite].to(rank, non_blocking=transfer_non_blocking)
+                        train_y_bite = train_y[digested:digested + bite].to(rank, non_blocking=transfer_non_blocking)
+                        test_x_bite = test_x[digested:digested + bite].to(rank, non_blocking=transfer_non_blocking)
+                        test_y_bite = test_y[digested:digested + bite].to(rank, non_blocking=transfer_non_blocking)
 
                         try:
                             output = forward(

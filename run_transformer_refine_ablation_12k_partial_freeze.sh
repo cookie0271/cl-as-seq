@@ -14,12 +14,10 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 export CUDA_VISIBLE_DEVICES
 
 common_overrides() {
-  echo "tasks=20|train_shots=5|test_shots=1|max_train_steps=12000|batch_size=256|eval_batch_size=64|eval_iters=32|summary_interval=250|eval_interval=1000|ckpt_interval=1000|freeze_backbone=True|enable_correction=True|enable_highway_gate=True|train_correction=True|train_gate=True|gate_bias_init=-1.0|train_head=True"
-}
+  echo "tasks=20|train_shots=5|test_shots=1|max_train_steps=12000|batch_size=256|eval_batch_size=64|eval_iters=32|summary_interval=250|eval_interval=1000|ckpt_interval=1000|freeze_backbone=True|enable_correction=True|enable_highway_gate=True|train_correction=True|train_gate=True|gate_bias_init=-1.0|train_head=True|num_workers=16|dataloader_pin_memory=True|dataloader_persistent_workers=True|dataloader_prefetch_factor=4|transfer_non_blocking=True|cudnn_benchmark=True"}
 
 score_overrides() {
-  echo "tasks=20|train_shots=5|test_shots=1|max_train_steps=12000|batch_size=256|eval_batch_size=64|eval_iters=32|freeze_backbone=True|enable_correction=True|enable_highway_gate=True|train_correction=True|train_gate=True|gate_bias_init=-1.0|train_head=True"
-}
+  echo "tasks=20|train_shots=5|test_shots=1|max_train_steps=12000|batch_size=256|eval_batch_size=64|eval_iters=32|freeze_backbone=True|enable_correction=True|enable_highway_gate=True|train_correction=True|train_gate=True|gate_bias_init=-1.0|train_head=True|num_workers=16|dataloader_pin_memory=True|dataloader_persistent_workers=True|dataloader_prefetch_factor=4|transfer_non_blocking=True|cudnn_benchmark=True"}
 
 usage() {
   cat <<USAGE
