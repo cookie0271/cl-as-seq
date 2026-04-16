@@ -1,4 +1,5 @@
 import math
+import random
 from functools import lru_cache
 
 import torch
@@ -190,7 +191,7 @@ class ContinualAttentionLayer(nn.Module):
 class ContinualTransformerLayer(nn.Module):
     """Transformer layer optimized for continual learning."""
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_adapter=False):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -203,13 +204,40 @@ class ContinualTransformerLayer(nn.Module):
             nn.Linear(config['tf_ff_dim'], config['hidden_dim']),
             nn.Dropout(config['tf_dropout']),
         )
+        self.adapter = BottleneckAdapter(config) if use_adapter else None
 
     def forward(self, xy_enc, attach_test_after, train_len=0, past_state=None, return_state=False):
         x, state = self.attn_layer(
             self.attn_layer_norm(xy_enc), attach_test_after=attach_test_after, train_len=train_len,
             past_state=past_state, return_state=return_state)
         x = x + self.mlp_layer(self.mlp_layer_norm(x))
+        if self.adapter is not None:
+            x = x + self.adapter(x)
         return x, state
+
+class BottleneckAdapter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden_dim = int(config['hidden_dim'])
+        adapter_dim = int(config.get('adapter_dim', 16))
+        self.adapter_dim = adapter_dim
+        self.location = config.get('adapter_location', 'post_layer')
+        self.down_proj = nn.Linear(hidden_dim, adapter_dim)
+        self.up_proj = nn.Linear(adapter_dim, hidden_dim)
+        act_name = str(config.get('adapter_activation', 'gelu')).lower()
+        if act_name == 'relu':
+            self.act = nn.ReLU()
+        else:
+            self.act = nn.GELU()
+
+        # Near-identity init at step 0.
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.up_proj.bias)
+
+    def forward(self, x):
+        delta = self.up_proj(self.act(self.down_proj(x)))
+        return x + delta
+
 
 
 def sample_test_attachment(train_y, test_y):
@@ -283,22 +311,142 @@ class ContinualTransformer(Model):
         else:
             raise NotImplementedError
 
+        adapter_layer_indices = self._resolve_adapter_layer_indices(
+            config.get('adapter_layers', 'last2'),
+            config['tf_layers'],
+        ) if config.get('enable_adapter', False) else set()
         self.tf_layers = nn.ModuleList([
-            ContinualTransformerLayer(config, layer_idx) for layer_idx in range(config['tf_layers'])
+            ContinualTransformerLayer(
+                config,
+                layer_idx,
+                use_adapter=(layer_idx in adapter_layer_indices),
+            ) for layer_idx in range(config['tf_layers'])
         ])
         self.enable_correction = config.get('enable_correction', True)
         self.enable_highway_gate = config.get('enable_highway_gate', True)
         self.post_backbone_refine = PostBackboneRefineAndGate(config)
+
+    @staticmethod
+    def _resolve_adapter_layer_indices(adapter_layers, num_layers):
+        if isinstance(adapter_layers, int):
+            n = max(0, min(int(adapter_layers), num_layers))
+            return set(range(num_layers - n, num_layers))
+        if isinstance(adapter_layers, (list, tuple)):
+            out = set()
+            for idx in adapter_layers:
+                i = int(idx)
+                if 0 <= i < num_layers:
+                    out.add(i)
+            return out
+
+        text = str(adapter_layers).strip().lower()
+        if text == 'all':
+            return set(range(num_layers))
+        if text.startswith('last'):
+            n = int(text[4:]) if len(text) > 4 else 0
+            n = max(0, min(n, num_layers))
+            return set(range(num_layers - n, num_layers))
+        if text == 'none' or text == '':
+            return set()
+
+        out = set()
+        for token in text.split(','):
+            token = token.strip()
+            if token == '':
+                continue
+            i = int(token)
+            if 0 <= i < num_layers:
+                out.add(i)
+        return out
 
     def set_trainable_modules(
             self,
             train_backbone=False,
             train_corr=True,
             train_gate=True,
+            train_adapter=False,
             train_head=True,
             partial_freeze_mode='none',
             train_last_tf_layers=0,
-            freeze_encoder=False):
+            freeze_encoder=False,
+            random_match_target_trainable_params=None,
+            random_match_seed=0,
+            random_match_scope='tf_only',
+            random_match_unit='layer_or_block',
+            random_match_target_last_tf_layers=2,
+            adapter_dim=None,
+            adapter_layers='last2',
+            adapter_location='post_layer',
+            target_trainable_params=None):
+        def _module_param_count(module):
+            return sum(p.numel() for p in module.parameters())
+
+        def _params_count(params):
+            return sum(p.numel() for p in params)
+
+        def _estimate_random_match_target():
+            explicit_target = random_match_target_trainable_params
+            if explicit_target is None:
+                explicit_target = target_trainable_params
+            if explicit_target is not None:
+                return int(explicit_target)
+
+            n_last = int(random_match_target_last_tf_layers)
+            n_last = max(0, min(n_last, len(self.tf_layers)))
+            target = _module_param_count(self.output) if train_head else 0
+            if n_last > 0:
+                target += sum(_module_param_count(layer) for layer in self.tf_layers[-n_last:])
+
+            refine_cfg = dict(self.config)
+            refine_cfg['enable_correction'] = True
+            refine_cfg['enable_highway_gate'] = True
+            refine_target = PostBackboneRefineAndGate(refine_cfg)
+            if refine_target.correction is not None:
+                target += _module_param_count(refine_target.correction)
+            if refine_target.gate is not None:
+                target += _module_param_count(refine_target.gate)
+            return int(target)
+
+        def _adapter_param_count_for_dim(dim, num_adapter_layers):
+            h = int(self.config['hidden_dim'])
+            d = int(dim)
+            # down(h->d) + up(d->h), both with bias
+            return num_adapter_layers * ((h * d + d) + (d * h + h))
+
+        def _build_adapter_dim_candidates(adapter_budget, num_adapter_layers):
+            hidden_dim = int(self.config['hidden_dim'])
+            explicit = self.config.get('adapter_dim_candidates', None)
+            if explicit is not None:
+                candidates = {max(1, int(x)) for x in explicit}
+            else:
+                # Standard PEFT-friendly bottleneck candidates.
+                candidates = {16, 32, 64, 128, 256, 512}
+            if adapter_dim is not None:
+                candidates.add(max(1, int(adapter_dim)))
+            # Keep adapter bottleneck semantically valid; do not exceed hidden size.
+            bounded = sorted({c for c in candidates if c <= hidden_dim})
+            if len(bounded) == 0:
+                bounded = [hidden_dim]
+            return bounded
+
+        def _replace_adapters(selected_layer_indices, selected_adapter_dim):
+            for layer_idx in selected_layer_indices:
+                old_adapter = self.tf_layers[layer_idx].adapter
+                if old_adapter is not None:
+                    ref_param = next(old_adapter.parameters(), None)
+                    device = ref_param.device if ref_param is not None else next(self.parameters()).device
+                    dtype = ref_param.dtype if ref_param is not None else next(self.parameters()).dtype
+                else:
+                    ref_param = next(self.tf_layers[layer_idx].parameters(), None)
+                    device = ref_param.device if ref_param is not None else next(self.parameters()).device
+                    dtype = ref_param.dtype if ref_param is not None else next(self.parameters()).dtype
+
+                adapter_cfg = dict(self.config)
+                adapter_cfg['adapter_dim'] = int(selected_adapter_dim)
+                adapter_cfg['adapter_location'] = adapter_location
+                new_adapter = BottleneckAdapter(adapter_cfg).to(device=device, dtype=dtype)
+                self.tf_layers[layer_idx].adapter = new_adapter
+
         backbone_modules = [self.x_encoder, self.y_encoder, self.pos_enc, self.tf_layers]
         if hasattr(self, 'x_proj'):
             backbone_modules.append(self.x_proj)
@@ -314,10 +462,17 @@ class ContinualTransformer(Model):
         if self.post_backbone_refine.gate is not None:
             for param in self.post_backbone_refine.gate.parameters():
                 param.requires_grad = train_gate
+        for layer in self.tf_layers:
+            if getattr(layer, 'adapter', None) is not None:
+                for param in layer.adapter.parameters():
+                    param.requires_grad = train_adapter
 
         for module in head_modules:
             for param in module.parameters():
                 param.requires_grad = train_head
+
+        selected_groups = []
+        target_params = None
 
         # Optional finer-grained partial-freeze controls.
         # Existing train_backbone behavior remains default when partial_freeze_mode is 'none'.
@@ -346,15 +501,187 @@ class ContinualTransformer(Model):
                 for layer in self.tf_layers:
                     for param in layer.parameters():
                         param.requires_grad = True
+            elif partial_freeze_mode in {'adapter_last2', 'adapter_standard'}:
+                adapter_layer_indices = sorted(self._resolve_adapter_layer_indices(adapter_layers, len(self.tf_layers)))
+                if len(adapter_layer_indices) == 0:
+                    raise ValueError(f'{partial_freeze_mode} mode requires non-empty adapter_layers.')
+
+                for layer in self.tf_layers:
+                    for param in layer.parameters():
+                        param.requires_grad = False
+
+                target_params = _estimate_random_match_target()
+                head_params = _module_param_count(self.output) if train_head else 0
+                adapter_budget = max(1, target_params - head_params)
+                adapter_candidates = _build_adapter_dim_candidates(adapter_budget, len(adapter_layer_indices))
+                strict_match = bool(self.config.get('adapter_strict_match', False))
+
+                if partial_freeze_mode == 'adapter_standard':
+                    if strict_match:
+                        print('Warning: adapter_strict_match=True ignored for adapter_standard baseline.')
+                    strict_match = False
+                    if adapter_dim is not None:
+                        best_dim = min(int(adapter_dim), int(self.config['hidden_dim']))
+                    else:
+                        preferred = int(self.config.get('adapter_default_dim', 64))
+                        if preferred in adapter_candidates:
+                            best_dim = preferred
+                        else:
+                            best_dim = min(adapter_candidates, key=lambda d: abs(d - preferred))
+                    best_total = head_params + _adapter_param_count_for_dim(best_dim, len(adapter_layer_indices))
+                else:
+                    if strict_match:
+                        print(
+                            'Warning: adapter_strict_match=True is deprecated; using bounded bottleneck candidates only.')
+                    best_dim = None
+                    best_gap = None
+                    best_total = None
+                    for candidate_dim in adapter_candidates:
+                        adapter_count = _adapter_param_count_for_dim(candidate_dim, len(adapter_layer_indices))
+                        total_candidate = head_params + adapter_count
+                        gap = abs(total_candidate - target_params)
+                        if best_gap is None or gap < best_gap:
+                            best_gap = gap
+                            best_dim = int(candidate_dim)
+                            best_total = int(total_candidate)
+
+                print('Adapter candidate trainable params:')
+                for candidate_dim in adapter_candidates:
+                    candidate_total = head_params + _adapter_param_count_for_dim(candidate_dim,
+                                                                                 len(adapter_layer_indices))
+                    print(
+                        f'  - dim={candidate_dim}: trainable={candidate_total:,} (gap={candidate_total - target_params:+,})')
+
+                _replace_adapters(adapter_layer_indices, best_dim)
+                self.config['adapter_dim'] = int(best_dim)
+                self.config['adapter_location'] = adapter_location
+                self.config['adapter_layers'] = adapter_layers
+
+                selected_count = 0
+                for layer_idx in adapter_layer_indices:
+                    layer_adapter = self.tf_layers[layer_idx].adapter
+                    if layer_adapter is None:
+                        continue
+                    adapter_params = list(layer_adapter.parameters())
+                    module_count = _params_count(adapter_params)
+                    selected_groups.append((f'tf_layers.{layer_idx}.adapter', module_count))
+                    selected_count += module_count
+                    for param in adapter_params:
+                        param.requires_grad = bool(train_adapter)
+
+                print(f'Adapter selection details ({partial_freeze_mode}):')
+                print(
+                    f'  - adapter_layers={adapter_layers} ({adapter_layer_indices}) | '
+                    f'adapter_location={adapter_location} | adapter_dim={best_dim}')
+                print(
+                    f'  - adapter_params={selected_count:,} | head_params={head_params:,} | '
+                    f'target={target_params:,} | total_selected={best_total:,} | gap={best_total - target_params:+,}')
+                print(
+                    f'  - hidden_dim={self.config["hidden_dim"]} | strict_match={strict_match} | '
+                    f'candidate_dims={adapter_candidates}')
+            elif partial_freeze_mode == 'random_match':
+                if random_match_scope != 'tf_only':
+                    raise ValueError(f'Unsupported random_match_scope: {random_match_scope}')
+
+                for layer in self.tf_layers:
+                    for param in layer.parameters():
+                        param.requires_grad = False
+
+                rng = random.Random(int(random_match_seed))
+                target_params = _estimate_random_match_target()
+                selected_layer_idx = set()
+
+                layer_candidates = []
+                for layer_idx, layer in enumerate(self.tf_layers):
+                    layer_params = list(layer.parameters())
+                    layer_candidates.append({
+                        'name': f'tf_layers.{layer_idx}',
+                        'params': layer_params,
+                        'count': _params_count(layer_params),
+                        'layer_idx': layer_idx,
+                    })
+                rng.shuffle(layer_candidates)
+
+                selected_count = 0
+                for candidate in layer_candidates:
+                    if selected_count + candidate['count'] <= target_params:
+                        for param in candidate['params']:
+                            param.requires_grad = True
+                        selected_groups.append((candidate['name'], candidate['count']))
+                        selected_count += candidate['count']
+                        selected_layer_idx.add(candidate['layer_idx'])
+
+                if random_match_unit == 'layer_or_block' and selected_count < target_params:
+                    block_candidates = []
+                    for layer_idx, layer in enumerate(self.tf_layers):
+                        if layer_idx in selected_layer_idx:
+                            continue
+                        block_specs = [
+                            ('attn_layer_norm', layer.attn_layer_norm),
+                            ('attn_layer', layer.attn_layer),
+                            ('mlp_layer_norm', layer.mlp_layer_norm),
+                            ('mlp_layer', layer.mlp_layer),
+                        ]
+                        for block_name, block_module in block_specs:
+                            block_params = list(block_module.parameters())
+                            if len(block_params) == 0:
+                                continue
+                            block_candidates.append({
+                                'name': f'tf_layers.{layer_idx}.{block_name}',
+                                'params': block_params,
+                                'count': _params_count(block_params),
+                            })
+                    rng.shuffle(block_candidates)
+
+                    for candidate in block_candidates:
+                        with_candidate = selected_count + candidate['count']
+                        if abs(target_params - with_candidate) <= abs(target_params - selected_count):
+                            for param in candidate['params']:
+                                param.requires_grad = True
+                            selected_groups.append((candidate['name'], candidate['count']))
+                            selected_count = with_candidate
+                elif random_match_unit != 'layer':
+                    raise ValueError(f'Unsupported random_match_unit: {random_match_unit}')
+
+                print('Random-match selection details:')
+                for name, count in selected_groups:
+                    print(f'  - {name}: {count:,} params')
+                print(
+                    f'Random-match totals: selected={selected_count:,} | target={target_params:,} | '
+                    f'gap={selected_count - target_params:+,} | seed={random_match_seed}')
             else:
                 raise ValueError(f'Unknown partial_freeze_mode: {partial_freeze_mode}')
 
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        selected_modules_text = ';'.join([f'{name}:{count}' for name, count in selected_groups])
+        self._trainable_summary = {
+            'trainable_params': int(trainable_params),
+            'target_trainable_params': int(target_params) if target_params is not None else '',
+            'trainable_param_gap': int(trainable_params - target_params) if target_params is not None else '',
+            'selected_modules': selected_modules_text,
+            'partial_freeze_mode': partial_freeze_mode,
+            'random_match_seed': int(random_match_seed) if partial_freeze_mode == 'random_match' else '',
+            'random_match_scope': random_match_scope if partial_freeze_mode == 'random_match' else '',
+            'random_match_unit': random_match_unit if partial_freeze_mode == 'random_match' else '',
+            'adapter_dim': int(self.config.get('adapter_dim', 0)) if partial_freeze_mode in {'adapter_last2',
+                                                                                             'adapter_standard'} else '',
+            'adapter_location': adapter_location if partial_freeze_mode in {'adapter_last2',
+                                                                            'adapter_standard'} else '',
+            'enable_adapter': bool(self.config.get('enable_adapter', False)) if partial_freeze_mode in {'adapter_last2',
+                                                                                                        'adapter_standard'} else '',
+            'adapter_strict_match': bool(self.config.get('adapter_strict_match', False)) if partial_freeze_mode in {
+                'adapter_last2', 'adapter_standard'} else '',
+            'adapter_layers': str(self.config.get('adapter_layers', '')) if partial_freeze_mode in {'adapter_last2',
+                                                                                                    'adapter_standard'} else '',
+            'adapter_baseline': partial_freeze_mode if partial_freeze_mode in {'adapter_last2',
+                                                                               'adapter_standard'} else '',
+        }
         module_status = {
             'backbone': train_backbone,
             'correction': train_corr and self.post_backbone_refine.correction is not None,
             'gate': train_gate and self.post_backbone_refine.gate is not None,
+            'adapter': train_adapter,
             'head': train_head,
             'partial_freeze_mode': partial_freeze_mode,
             'train_last_tf_layers': train_last_tf_layers,
@@ -363,6 +690,9 @@ class ContinualTransformer(Model):
         print(
             'Trainable modules: '
             f'{module_status} | total params={total_params:,} | trainable params={trainable_params:,}')
+
+    def get_trainable_summary(self):
+        return getattr(self, '_trainable_summary', None)
 
     def forward(self, train_x, train_y, test_x, test_y, evaluate=False):
         if self.input_type == 'image':

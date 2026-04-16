@@ -323,10 +323,28 @@ def train(rank, world_size, port, args, config, distributed=True):
         train_corr=config.get('train_correction', True),
         train_gate=config.get('train_gate', True),
         train_head=config.get('train_head', True),
+        train_adapter=config.get('train_adapter', False),
         partial_freeze_mode=config.get('partial_freeze_mode', 'none'),
         train_last_tf_layers=config.get('train_last_tf_layers', 0),
         freeze_encoder=config.get('freeze_encoder', False),
+        random_match_target_trainable_params=config.get('random_match_target_trainable_params', None),
+        random_match_seed=config.get('random_match_seed', config.get('seed', 0)),
+        random_match_scope=config.get('random_match_scope', 'tf_only'),
+        random_match_unit=config.get('random_match_unit', 'layer_or_block'),
+        random_match_target_last_tf_layers=config.get('random_match_target_last_tf_layers', 2),
+        adapter_dim=config.get('adapter_dim', None),
+        adapter_layers=config.get('adapter_layers', 'last2'),
+        adapter_location=config.get('adapter_location', 'post_layer'),
+        target_trainable_params=config.get('target_trainable_params', None),
     )
+    if rank == 0 and hasattr(model, 'get_trainable_summary'):
+        trainable_summary = model.get_trainable_summary()
+        if trainable_summary is not None:
+            summary_path = path.join(config['log_dir'], 'trainable_summary.yaml')
+            with open(summary_path, 'w') as f:
+                yaml.safe_dump(trainable_summary, f, sort_keys=False)
+            print(f'Trainable summary saved to {summary_path}')
+
     if distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DDP(

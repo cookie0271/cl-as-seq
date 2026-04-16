@@ -46,19 +46,41 @@ def get_config(config_path):
     return config
 
 def load_state_dict_flexible(model, state_dict):
-    try:
-        model.load_state_dict(state_dict)
-        return
-    except RuntimeError:
-        pass
-
+    candidates = [state_dict]
     if any(k.startswith('module.') for k in state_dict):
-        stripped = {k[len('module.'):]: v for k, v in state_dict.items()}
-        model.load_state_dict(stripped)
+        candidates.append({k[len('module.'):]: v for k, v in state_dict.items()})
     else:
-        prefixed = {f'module.{k}': v for k, v in state_dict.items()}
-        model.load_state_dict(prefixed)
+        candidates.append({f'module.{k}': v for k, v in state_dict.items()})
 
+    for candidate in candidates:
+        try:
+            model.load_state_dict(candidate)
+            return
+        except RuntimeError:
+            continue
+
+        # Keep evaluation robust when checkpoint and runtime config differ by optional modules
+        # (e.g., adapter/correction/gate toggles).
+    model_keys = set(model.state_dict().keys())
+    best_candidate = max(candidates, key=lambda cand: len(model_keys.intersection(cand.keys())))
+    model_state = model.state_dict()
+    filtered = {}
+    dropped_mismatch = []
+    for k, v in best_candidate.items():
+        if k not in model_state:
+            continue
+        if model_state[k].shape != v.shape:
+            dropped_mismatch.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+            continue
+        filtered[k] = v
+
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    if len(missing) > 0:
+        print(f'Warning: missing keys during checkpoint load ({len(missing)}).')
+    if len(unexpected) > 0:
+        print(f'Warning: unexpected keys during checkpoint load ({len(unexpected)}).')
+    if len(dropped_mismatch) > 0:
+        print(f'Warning: dropped shape-mismatched keys during checkpoint load ({len(dropped_mismatch)}).')
 
 
 def set_seed(seed):
