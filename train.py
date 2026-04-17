@@ -324,6 +324,7 @@ def train(rank, world_size, port, args, config, distributed=True):
         train_gate=config.get('train_gate', True),
         train_head=config.get('train_head', True),
         train_adapter=config.get('train_adapter', False),
+        train_lora=config.get('train_lora', False),
         partial_freeze_mode=config.get('partial_freeze_mode', 'none'),
         train_last_tf_layers=config.get('train_last_tf_layers', 0),
         freeze_encoder=config.get('freeze_encoder', False),
@@ -335,6 +336,13 @@ def train(rank, world_size, port, args, config, distributed=True):
         adapter_dim=config.get('adapter_dim', None),
         adapter_layers=config.get('adapter_layers', 'last2'),
         adapter_location=config.get('adapter_location', 'post_layer'),
+        lora_rank=config.get('lora_rank', None),
+        lora_alpha=config.get('lora_alpha', 16),
+        lora_dropout=config.get('lora_dropout', 0.0),
+        lora_layers=config.get('lora_layers', 'all'),
+        lora_target_modules=config.get('lora_target_modules', 'attn_only'),
+        lora_strict_match=config.get('lora_strict_match', config.get('strict_match', False)),
+        lora_rank_candidates=config.get('lora_rank_candidates', None),
         target_trainable_params=config.get('target_trainable_params', None),
     )
     if rank == 0 and hasattr(model, 'get_trainable_summary'):

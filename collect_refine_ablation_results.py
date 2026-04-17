@@ -86,6 +86,8 @@ def load_analysis_summary(run_name: str):
 
 
 def infer_method_name(exp_name: str):
+    if exp_name.startswith('lora_standard'):
+        return 'lora_standard'
     if exp_name.startswith('random_match_no_corr_gate'):
         return 'random_match_no_corr_gate'
     if exp_name.startswith('last2_no_corr_gate'):
@@ -162,6 +164,13 @@ def collect_rows(run_root: Path):
             'adapter_location': trainable.get('adapter_location', cfg.get('adapter_location', '')),
             'adapter_layers': trainable.get('adapter_layers', cfg.get('adapter_layers', '')),
             'adapter_strict_match': trainable.get('adapter_strict_match', cfg.get('adapter_strict_match', '')),
+            'enable_lora': trainable.get('enable_lora', cfg.get('enable_lora', '')),
+            'lora_rank': trainable.get('lora_rank', cfg.get('lora_rank', '')),
+            'lora_alpha': trainable.get('lora_alpha', cfg.get('lora_alpha', '')),
+            'lora_dropout': trainable.get('lora_dropout', cfg.get('lora_dropout', '')),
+            'lora_layers': trainable.get('lora_layers', cfg.get('lora_layers', '')),
+            'lora_target_modules': trainable.get('lora_target_modules', cfg.get('lora_target_modules', '')),
+            'lora_strict_match': trainable.get('lora_strict_match', cfg.get('lora_strict_match', cfg.get('strict_match', ''))),
             'gate_bias_init': cfg.get('gate_bias_init', ''),
             'mean_gate': analysis.get('mean_gate', float('nan')),
             'mean_gate_train': analysis.get('mean_gate_train', float('nan')),
@@ -193,6 +202,8 @@ def main():
         'partial_freeze_mode', 'random_match_seed', 'random_match_scope', 'random_match_unit',
         'enable_adapter', 'adapter_dim', 'adapter_location', 'adapter_layers', 'adapter_strict_match',
         'gate_bias_init',
+        'enable_lora', 'lora_rank', 'lora_alpha', 'lora_dropout', 'lora_layers', 'lora_target_modules',
+        'lora_strict_match',
         'mean_gate', 'mean_gate_train', 'mean_gate_test', 'mean_delta_norm', 'mean_h_minus_prev_norm',
         'log_dir',
     ]

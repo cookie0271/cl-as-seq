@@ -238,6 +238,36 @@ class BottleneckAdapter(nn.Module):
         delta = self.up_proj(self.act(self.down_proj(x)))
         return x + delta
 
+class LoRALinear(nn.Module):
+    """Standard LoRA wrapper for a frozen linear layer."""
+
+    def __init__(self, base_linear: nn.Linear, rank: int, alpha: float = 16.0, dropout: float = 0.0):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f'LoRA rank must be > 0, got {rank}')
+        self.base_linear = base_linear
+        self.rank = int(rank)
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / self.rank
+        self.dropout = nn.Dropout(float(dropout)) if float(dropout) > 0 else nn.Identity()
+
+        in_features = base_linear.in_features
+        out_features = base_linear.out_features
+        self.lora_A = nn.Linear(in_features, self.rank, bias=False)
+        self.lora_B = nn.Linear(self.rank, out_features, bias=False)
+
+        # LoRA init: start near identity mapping (delta ~= 0).
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+        for param in self.base_linear.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        base = self.base_linear(x)
+        delta = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+        return base + delta
+
 
 
 def sample_test_attachment(train_y, test_y):
@@ -325,6 +355,56 @@ class ContinualTransformer(Model):
         self.enable_correction = config.get('enable_correction', True)
         self.enable_highway_gate = config.get('enable_highway_gate', True)
         self.post_backbone_refine = PostBackboneRefineAndGate(config)
+        self._lora_attached = False
+
+    @staticmethod
+    def _resolve_lora_layer_indices(lora_layers, num_layers):
+        return ContinualTransformer._resolve_adapter_layer_indices(lora_layers, num_layers)
+
+    @staticmethod
+    def _normalize_lora_targets(lora_target_modules):
+        text = str(lora_target_modules).strip().lower()
+        if text in {'attn_only', 'attn'}:
+            return 'attn_only'
+        if text in {'attn_and_mlp', 'all', 'full'}:
+            return 'attn_and_mlp'
+        raise ValueError(f'Unsupported lora_target_modules={lora_target_modules}')
+
+    def _iter_lora_target_linears(self, lora_layers, lora_target_modules):
+        layer_indices = sorted(self._resolve_lora_layer_indices(lora_layers, len(self.tf_layers)))
+        if len(layer_indices) == 0:
+            raise ValueError('LoRA requires non-empty lora_layers.')
+        target_mode = self._normalize_lora_targets(lora_target_modules)
+
+        targets = []
+        for layer_idx in layer_indices:
+            layer = self.tf_layers[layer_idx]
+            targets.append((f'tf_layers.{layer_idx}.attn_layer.qkv_linear', layer.attn_layer.qkv_linear))
+            targets.append((f'tf_layers.{layer_idx}.attn_layer.proj_linear', layer.attn_layer.proj_linear))
+            if target_mode == 'attn_and_mlp':
+                targets.append((f'tf_layers.{layer_idx}.mlp_layer.0', layer.mlp_layer[0]))
+                targets.append((f'tf_layers.{layer_idx}.mlp_layer.2', layer.mlp_layer[2]))
+        return layer_indices, target_mode, targets
+
+    def _attach_lora_modules(self, lora_rank, lora_alpha, lora_dropout, lora_layers, lora_target_modules):
+        layer_indices, target_mode, targets = self._iter_lora_target_linears(lora_layers, lora_target_modules)
+        for module_name, linear in targets:
+            if isinstance(linear, LoRALinear):
+                continue
+            ref_param = next(linear.parameters(), None)
+            if ref_param is not None:
+                device, dtype = ref_param.device, ref_param.dtype
+            else:
+                model_param = next(self.parameters())
+                device, dtype = model_param.device, model_param.dtype
+            lora_linear = LoRALinear(linear, rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout).to(
+                device=device, dtype=dtype
+            )
+            parent_name, attr_name = module_name.rsplit('.', 1)
+            parent = self.get_submodule(parent_name)
+            setattr(parent, attr_name, lora_linear)
+        self._lora_attached = True
+        return layer_indices, target_mode
 
     @staticmethod
     def _resolve_adapter_layer_indices(adapter_layers, num_layers):
@@ -365,6 +445,7 @@ class ContinualTransformer(Model):
             train_corr=True,
             train_gate=True,
             train_adapter=False,
+            train_lora = False,
             train_head=True,
             partial_freeze_mode='none',
             train_last_tf_layers=0,
@@ -377,6 +458,13 @@ class ContinualTransformer(Model):
             adapter_dim=None,
             adapter_layers='last2',
             adapter_location='post_layer',
+            lora_rank=None,
+            lora_alpha=16,
+            lora_dropout=0.0,
+            lora_layers='all',
+            lora_target_modules='attn_only',
+            lora_strict_match=False,
+            lora_rank_candidates=None,
             target_trainable_params=None):
         def _module_param_count(module):
             return sum(p.numel() for p in module.parameters())
@@ -447,6 +535,14 @@ class ContinualTransformer(Model):
                 new_adapter = BottleneckAdapter(adapter_cfg).to(device=device, dtype=dtype)
                 self.tf_layers[layer_idx].adapter = new_adapter
 
+        def _lora_param_count_for_rank(rank, targets):
+            total = 0
+            for _, linear in targets:
+                base = linear.base_linear if isinstance(linear, LoRALinear) else linear
+                out_dim, in_dim = base.weight.shape
+                total += rank * (in_dim + out_dim)
+            return int(total)
+
         backbone_modules = [self.x_encoder, self.y_encoder, self.pos_enc, self.tf_layers]
         if hasattr(self, 'x_proj'):
             backbone_modules.append(self.x_proj)
@@ -466,6 +562,10 @@ class ContinualTransformer(Model):
             if getattr(layer, 'adapter', None) is not None:
                 for param in layer.adapter.parameters():
                     param.requires_grad = train_adapter
+            for module in layer.modules():
+                if isinstance(module, LoRALinear):
+                    module.lora_A.weight.requires_grad = bool(train_lora)
+                    module.lora_B.weight.requires_grad = bool(train_lora)
 
         for module in head_modules:
             for param in module.parameters():
@@ -579,6 +679,82 @@ class ContinualTransformer(Model):
                 print(
                     f'  - hidden_dim={self.config["hidden_dim"]} | strict_match={strict_match} | '
                     f'candidate_dims={adapter_candidates}')
+            elif partial_freeze_mode == 'lora_standard':
+                for layer in self.tf_layers:
+                    for param in layer.parameters():
+                        param.requires_grad = False
+
+                if bool(lora_strict_match):
+                    print('Warning: lora_strict_match=True ignored for standard LoRA baseline.')
+                lora_layer_indices, normalized_targets, target_linears = self._iter_lora_target_linears(
+                    lora_layers=lora_layers,
+                    lora_target_modules=lora_target_modules,
+                )
+                target_params = _estimate_random_match_target()
+                head_params = _module_param_count(self.output) if train_head else 0
+
+                candidates = lora_rank_candidates if lora_rank_candidates is not None else self.config.get(
+                    'lora_rank_candidates', [4, 8, 16, 32, 64])
+                rank_candidates = sorted({max(1, int(r)) for r in candidates})
+                if len(rank_candidates) == 0:
+                    rank_candidates = [8]
+                if lora_rank is not None:
+                    selected_rank = max(1, int(lora_rank))
+                    if selected_rank not in rank_candidates:
+                        rank_candidates.append(selected_rank)
+                        rank_candidates = sorted(rank_candidates)
+                else:
+                    default_rank = int(self.config.get('lora_default_rank', 16))
+                    selected_rank = default_rank if default_rank in rank_candidates else min(
+                        rank_candidates, key=lambda r: abs(r - default_rank))
+
+                print('LoRA candidate trainable params:')
+                for cand_rank in rank_candidates:
+                    lora_count = _lora_param_count_for_rank(cand_rank, target_linears)
+                    total_candidate = head_params + lora_count
+                    print(
+                        f'  - rank={cand_rank}: trainable={total_candidate:,} (gap={total_candidate - target_params:+,})')
+
+                lora_layer_indices, normalized_targets = self._attach_lora_modules(
+                    lora_rank=selected_rank,
+                    lora_alpha=float(lora_alpha),
+                    lora_dropout=float(lora_dropout),
+                    lora_layers=lora_layers,
+                    lora_target_modules=normalized_targets,
+                )
+
+                lora_selected_count = 0
+                for layer_idx in lora_layer_indices:
+                    layer = self.tf_layers[layer_idx]
+                    for module_name, module in layer.named_modules():
+                        if isinstance(module, LoRALinear):
+                            a_count = module.lora_A.weight.numel()
+                            b_count = module.lora_B.weight.numel()
+                            lora_selected_count += a_count + b_count
+                            selected_groups.append((f'tf_layers.{layer_idx}.{module_name}.lora', a_count + b_count))
+                            module.lora_A.weight.requires_grad = bool(train_lora)
+                            module.lora_B.weight.requires_grad = bool(train_lora)
+                            for param in module.base_linear.parameters():
+                                param.requires_grad = False
+
+                selected_total = head_params + lora_selected_count
+                self.config['enable_lora'] = True
+                self.config['lora_rank'] = int(selected_rank)
+                self.config['lora_alpha'] = float(lora_alpha)
+                self.config['lora_dropout'] = float(lora_dropout)
+                self.config['lora_layers'] = lora_layers
+                self.config['lora_target_modules'] = normalized_targets
+                print('LoRA selection details (lora_standard):')
+                print(
+                    f'  - baseline=standard_lora | hidden_dim={self.config["hidden_dim"]} | '
+                    f'lora_rank={selected_rank} | lora_alpha={float(lora_alpha):g} | lora_dropout={float(lora_dropout):g}')
+                print(
+                    f'  - lora_target_modules={normalized_targets} | lora_layers={lora_layers} ({lora_layer_indices})')
+                print(
+                    f'  - lora_params={lora_selected_count:,} | head_params={head_params:,} | '
+                    f'target={target_params:,} | total_selected={selected_total:,} | gap={selected_total - target_params:+,}')
+                print(
+                    f'  - strict_match=False | train_modules=lora+head | rank_candidates={rank_candidates}')
             elif partial_freeze_mode == 'random_match':
                 if random_match_scope != 'tf_only':
                     raise ValueError(f'Unsupported random_match_scope: {random_match_scope}')
@@ -676,12 +852,24 @@ class ContinualTransformer(Model):
                                                                                                     'adapter_standard'} else '',
             'adapter_baseline': partial_freeze_mode if partial_freeze_mode in {'adapter_last2',
                                                                                'adapter_standard'} else '',
+            'enable_lora': bool(
+                self.config.get('enable_lora', False)) if partial_freeze_mode == 'lora_standard' else '',
+            'lora_rank': int(self.config.get('lora_rank', 0)) if partial_freeze_mode == 'lora_standard' else '',
+            'lora_alpha': float(self.config.get('lora_alpha', 0.0)) if partial_freeze_mode == 'lora_standard' else '',
+            'lora_dropout': float(
+                self.config.get('lora_dropout', 0.0)) if partial_freeze_mode == 'lora_standard' else '',
+            'lora_layers': str(self.config.get('lora_layers', '')) if partial_freeze_mode == 'lora_standard' else '',
+            'lora_target_modules': str(
+                self.config.get('lora_target_modules', '')) if partial_freeze_mode == 'lora_standard' else '',
+            'lora_strict_match': bool(lora_strict_match) if partial_freeze_mode == 'lora_standard' else '',
+            'lora_baseline': partial_freeze_mode if partial_freeze_mode == 'lora_standard' else '',
         }
         module_status = {
             'backbone': train_backbone,
             'correction': train_corr and self.post_backbone_refine.correction is not None,
             'gate': train_gate and self.post_backbone_refine.gate is not None,
             'adapter': train_adapter,
+            'lora': train_lora,
             'head': train_head,
             'partial_freeze_mode': partial_freeze_mode,
             'train_last_tf_layers': train_last_tf_layers,

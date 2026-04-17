@@ -21,6 +21,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataset import DATASET
 from models import MODEL
+from models.trainable_utils import set_trainable_modules
 from train import forward
 from utils import Timer
 
@@ -163,6 +164,34 @@ def train(rank, world_size, port, args, config, distributed=True):
     # Build model
     device = torch.device('cuda', rank)
     model = MODEL[config['model']](config).to(device)
+    set_trainable_modules(
+        model,
+        train_backbone=config.get('freeze_backbone', True) is False,
+        train_corr=config.get('train_correction', True),
+        train_gate=config.get('train_gate', True),
+        train_head=config.get('train_head', True),
+        train_adapter=config.get('train_adapter', False),
+        train_lora=config.get('train_lora', False),
+        partial_freeze_mode=config.get('partial_freeze_mode', 'none'),
+        train_last_tf_layers=config.get('train_last_tf_layers', 0),
+        freeze_encoder=config.get('freeze_encoder', False),
+        random_match_target_trainable_params=config.get('random_match_target_trainable_params', None),
+        random_match_seed=config.get('random_match_seed', config.get('seed', 0)),
+        random_match_scope=config.get('random_match_scope', 'tf_only'),
+        random_match_unit=config.get('random_match_unit', 'layer_or_block'),
+        random_match_target_last_tf_layers=config.get('random_match_target_last_tf_layers', 2),
+        adapter_dim=config.get('adapter_dim', None),
+        adapter_layers=config.get('adapter_layers', 'last2'),
+        adapter_location=config.get('adapter_location', 'post_layer'),
+        lora_rank=config.get('lora_rank', None),
+        lora_alpha=config.get('lora_alpha', 16),
+        lora_dropout=config.get('lora_dropout', 0.0),
+        lora_layers=config.get('lora_layers', 'all'),
+        lora_target_modules=config.get('lora_target_modules', 'attn_only'),
+        lora_strict_match=config.get('lora_strict_match', config.get('strict_match', False)),
+        lora_rank_candidates=config.get('lora_rank_candidates', None),
+        target_trainable_params=config.get('target_trainable_params', None),
+    )
     if distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DDP(
@@ -194,8 +223,22 @@ def train(rank, world_size, port, args, config, distributed=True):
         raise RuntimeError(f'Latest checkpoint {ckpt_path} does not match max_train_steps {config["max_train_steps"]}')
     ckpt = torch.load(ckpt_path, map_location='cpu')
     load_state_dict_flexible(model, ckpt['model'])
-    optim.load_state_dict(ckpt['optim'])
-    lr_sched.load_state_dict(ckpt['lr_sched'])
+    optim_loaded = False
+    if 'optim' in ckpt:
+        try:
+            optim.load_state_dict(ckpt['optim'])
+            optim_loaded = True
+        except ValueError as e:
+            print(f'Warning: optimizer state incompatible with current trainable parameter groups. '
+                  f'Using freshly initialized optimizer. ({e})')
+    if 'lr_sched' in ckpt:
+        if optim_loaded:
+            try:
+                lr_sched.load_state_dict(ckpt['lr_sched'])
+            except ValueError as e:
+                print(f'Warning: lr scheduler state incompatible; using fresh scheduler. ({e})')
+        else:
+            print('Warning: skipping lr scheduler state restore because optimizer state was not loaded.')
     print(f'Checkpoint loaded from {ckpt_path}')
     optim.zero_grad()
 

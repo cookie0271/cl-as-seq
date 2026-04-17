@@ -4,6 +4,7 @@ def set_trainable_modules(
         train_corr=True,
         train_gate=True,
         train_adapter=False,
+        train_lora=False,
         train_head=True,
         partial_freeze_mode='none',
         train_last_tf_layers=0,
@@ -16,6 +17,13 @@ def set_trainable_modules(
         adapter_dim=None,
         adapter_layers='last2',
         adapter_location='post_layer',
+        lora_rank=None,
+        lora_alpha=16,
+        lora_dropout=0.0,
+        lora_layers='all',
+        lora_target_modules='attn_only',
+        lora_strict_match=False,
+        lora_rank_candidates=None,
         target_trainable_params=None):
     if hasattr(model, 'set_trainable_modules'):
         model.set_trainable_modules(
@@ -23,6 +31,7 @@ def set_trainable_modules(
             train_corr=train_corr,
             train_gate=train_gate,
             train_adapter=train_adapter,
+            train_lora=train_lora,
             train_head=train_head,
             partial_freeze_mode=partial_freeze_mode,
             train_last_tf_layers=train_last_tf_layers,
@@ -35,6 +44,13 @@ def set_trainable_modules(
             adapter_dim=adapter_dim,
             adapter_layers=adapter_layers,
             adapter_location=adapter_location,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            lora_layers=lora_layers,
+            lora_target_modules=lora_target_modules,
+            lora_strict_match=lora_strict_match,
+            lora_rank_candidates=lora_rank_candidates,
             target_trainable_params=target_trainable_params,
         )
     return model
