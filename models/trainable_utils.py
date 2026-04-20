@@ -5,6 +5,7 @@ def set_trainable_modules(
         train_gate=True,
         train_adapter=False,
         train_lora=False,
+        train_bitfit=False,
         train_head=True,
         partial_freeze_mode='none',
         train_last_tf_layers=0,
@@ -24,12 +25,17 @@ def set_trainable_modules(
         lora_target_modules='attn_only',
         lora_strict_match=False,
         lora_rank_candidates=None,
+        bitfit_scope='transformer_only',
+        bitfit_include_layernorm_bias=True,
+        bitfit_include_head_bias=True,
+        bitfit_strict_match=False,
         target_trainable_params=None):
     if hasattr(model, 'set_trainable_modules'):
         model.set_trainable_modules(
             train_backbone=train_backbone,
             train_corr=train_corr,
             train_gate=train_gate,
+            train_bitfit=train_bitfit,
             train_adapter=train_adapter,
             train_lora=train_lora,
             train_head=train_head,
@@ -51,6 +57,10 @@ def set_trainable_modules(
             lora_target_modules=lora_target_modules,
             lora_strict_match=lora_strict_match,
             lora_rank_candidates=lora_rank_candidates,
+            bitfit_scope=bitfit_scope,
+            bitfit_include_layernorm_bias=bitfit_include_layernorm_bias,
+            bitfit_include_head_bias=bitfit_include_head_bias,
+            bitfit_strict_match=bitfit_strict_match,
             target_trainable_params=target_trainable_params,
         )
     return model

@@ -324,6 +324,7 @@ def train(rank, world_size, port, args, config, distributed=True):
         train_gate=config.get('train_gate', True),
         train_head=config.get('train_head', True),
         train_adapter=config.get('train_adapter', False),
+        train_bitfit=config.get('train_bitfit', config.get('enable_bitfit', False)),
         train_lora=config.get('train_lora', False),
         partial_freeze_mode=config.get('partial_freeze_mode', 'none'),
         train_last_tf_layers=config.get('train_last_tf_layers', 0),
@@ -343,6 +344,10 @@ def train(rank, world_size, port, args, config, distributed=True):
         lora_target_modules=config.get('lora_target_modules', 'attn_only'),
         lora_strict_match=config.get('lora_strict_match', config.get('strict_match', False)),
         lora_rank_candidates=config.get('lora_rank_candidates', None),
+        bitfit_scope=config.get('bitfit_scope', 'transformer_only'),
+        bitfit_include_layernorm_bias=config.get('bitfit_include_layernorm_bias', True),
+        bitfit_include_head_bias=config.get('bitfit_include_head_bias', True),
+        bitfit_strict_match=config.get('bitfit_strict_match', config.get('strict_match', False)),
         target_trainable_params=config.get('target_trainable_params', None),
     )
     if rank == 0 and hasattr(model, 'get_trainable_summary'):

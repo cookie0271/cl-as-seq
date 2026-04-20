@@ -444,6 +444,7 @@ class ContinualTransformer(Model):
             train_backbone=False,
             train_corr=True,
             train_gate=True,
+            train_bitfit=False,
             train_adapter=False,
             train_lora = False,
             train_head=True,
@@ -465,6 +466,10 @@ class ContinualTransformer(Model):
             lora_target_modules='attn_only',
             lora_strict_match=False,
             lora_rank_candidates=None,
+            bitfit_scope='transformer_only',
+            bitfit_include_layernorm_bias=True,
+            bitfit_include_head_bias=True,
+            bitfit_strict_match=False,
             target_trainable_params=None):
         def _module_param_count(module):
             return sum(p.numel() for p in module.parameters())
@@ -542,6 +547,45 @@ class ContinualTransformer(Model):
                 out_dim, in_dim = base.weight.shape
                 total += rank * (in_dim + out_dim)
             return int(total)
+
+        def _is_layernorm_bias(name):
+            return name.endswith('attn_layer_norm.bias') or name.endswith('mlp_layer_norm.bias')
+
+        def _is_bitfit_bias_name(name):
+            return name.endswith('.bias') or name == 'bias'
+
+        def _extract_tf_layer_index(name):
+            prefix = 'tf_layers.'
+            if not name.startswith(prefix):
+                return None
+            remain = name[len(prefix):]
+            token = remain.split('.', 1)[0]
+            try:
+                return int(token)
+            except ValueError:
+                return None
+
+        def _bitfit_scope_match(param_name):
+            if bitfit_scope == 'transformer_only':
+                return param_name.startswith('tf_layers.')
+            if bitfit_scope == 'last2_only':
+                idx = _extract_tf_layer_index(param_name)
+                return idx is not None and idx >= max(0, len(self.tf_layers) - 2)
+            if bitfit_scope == 'transformer_and_encoder':
+                return (
+                        param_name.startswith('tf_layers.')
+                        or param_name.startswith('x_encoder.')
+                        or param_name.startswith('x_proj.')
+                )
+            if bitfit_scope == 'all_backbone':
+                return (
+                        param_name.startswith('tf_layers.')
+                        or param_name.startswith('x_encoder.')
+                        or param_name.startswith('x_proj.')
+                        or param_name.startswith('y_encoder.')
+                        or param_name.startswith('pos_enc.')
+                )
+            raise ValueError(f'Unsupported bitfit_scope={bitfit_scope}')
 
         backbone_modules = [self.x_encoder, self.y_encoder, self.pos_enc, self.tf_layers]
         if hasattr(self, 'x_proj'):
@@ -755,6 +799,60 @@ class ContinualTransformer(Model):
                     f'target={target_params:,} | total_selected={selected_total:,} | gap={selected_total - target_params:+,}')
                 print(
                     f'  - strict_match=False | train_modules=lora+head | rank_candidates={rank_candidates}')
+            elif partial_freeze_mode == 'bitfit_standard':
+                if bool(bitfit_strict_match):
+                    print('Warning: bitfit_strict_match=True ignored for standard BitFit baseline.')
+                # Freeze all backbone params first; only selected bias params will be re-enabled.
+                for module in backbone_modules:
+                    for param in module.parameters():
+                        param.requires_grad = False
+
+                selected_bias = []
+                skipped_layernorm = []
+                for name, param in self.named_parameters():
+                    if not _is_bitfit_bias_name(name):
+                        continue
+                    if not _bitfit_scope_match(name):
+                        continue
+                    if (not bool(bitfit_include_layernorm_bias)) and _is_layernorm_bias(name):
+                        skipped_layernorm.append(name)
+                        continue
+                    param.requires_grad = bool(train_bitfit)
+                    if bool(train_bitfit):
+                        selected_bias.append((name, param.numel()))
+                        selected_groups.append((name, param.numel()))
+
+                # Standard BitFit baseline keeps full output head trainable by design.
+                for param in self.output.parameters():
+                    param.requires_grad = bool(train_head)
+                if not bool(bitfit_include_head_bias) and self.output.bias is not None:
+                    self.output.bias.requires_grad = False
+
+                trainable_bias_params = sum(
+                    p.numel() for name, p in self.named_parameters()
+                    if p.requires_grad and _is_bitfit_bias_name(name)
+                )
+                trainable_head_params = sum(p.numel() for p in self.output.parameters() if p.requires_grad)
+                selected_bias_params = sum(count for _, count in selected_bias)
+                strict_match = False
+                self.config['enable_bitfit'] = True
+                self.config['train_bitfit'] = bool(train_bitfit)
+                self.config['bitfit_scope'] = bitfit_scope
+                self.config['bitfit_include_layernorm_bias'] = bool(bitfit_include_layernorm_bias)
+                self.config['bitfit_include_head_bias'] = bool(bitfit_include_head_bias)
+                self.config['bitfit_strict_match'] = strict_match
+                print('BitFit selection details (bitfit_standard):')
+                print(
+                    f'  - baseline=standard_bitfit_bias_only | bitfit_scope={bitfit_scope} | '
+                    f'include_layernorm_bias={bool(bitfit_include_layernorm_bias)} | '
+                    f'include_head_bias={bool(bitfit_include_head_bias)}')
+                print(
+                    f'  - trainable_backbone_bias_params={selected_bias_params:,} | '
+                    f'trainable_head_params={trainable_head_params:,} | '
+                    f'trainable_bias_params(total)={trainable_bias_params:,}')
+                print(
+                    f'  - strict_match={strict_match} | train_modules=bitfit_bias+head | '
+                    f'skipped_layernorm_bias={len(skipped_layernorm)}')
             elif partial_freeze_mode == 'random_match':
                 if random_match_scope != 'tf_only':
                     raise ValueError(f'Unsupported random_match_scope: {random_match_scope}')
@@ -863,6 +961,24 @@ class ContinualTransformer(Model):
                 self.config.get('lora_target_modules', '')) if partial_freeze_mode == 'lora_standard' else '',
             'lora_strict_match': bool(lora_strict_match) if partial_freeze_mode == 'lora_standard' else '',
             'lora_baseline': partial_freeze_mode if partial_freeze_mode == 'lora_standard' else '',
+            'enable_bitfit': bool(
+                self.config.get('enable_bitfit', False)) if partial_freeze_mode == 'bitfit_standard' else '',
+            'train_bitfit': bool(
+                self.config.get('train_bitfit', False)) if partial_freeze_mode == 'bitfit_standard' else '',
+            'bitfit_scope': str(
+                self.config.get('bitfit_scope', '')) if partial_freeze_mode == 'bitfit_standard' else '',
+            'bitfit_include_layernorm_bias': bool(self.config.get('bitfit_include_layernorm_bias',
+                                                                  True)) if partial_freeze_mode == 'bitfit_standard' else '',
+            'bitfit_include_head_bias': bool(
+                self.config.get('bitfit_include_head_bias', True)) if partial_freeze_mode == 'bitfit_standard' else '',
+            'bitfit_strict_match': bool(
+                self.config.get('bitfit_strict_match', False)) if partial_freeze_mode == 'bitfit_standard' else '',
+            'bitfit_baseline': partial_freeze_mode if partial_freeze_mode == 'bitfit_standard' else '',
+            'trainable_bias_params': int(sum(
+                p.numel() for n, p in self.named_parameters()
+                if p.requires_grad and (n.endswith('.bias') or n == 'bias')
+            )),
+            'trainable_head_params': int(sum(p.numel() for p in self.output.parameters() if p.requires_grad)),
         }
         module_status = {
             'backbone': train_backbone,
@@ -870,6 +986,7 @@ class ContinualTransformer(Model):
             'gate': train_gate and self.post_backbone_refine.gate is not None,
             'adapter': train_adapter,
             'lora': train_lora,
+            'bitfit': train_bitfit,
             'head': train_head,
             'partial_freeze_mode': partial_freeze_mode,
             'train_last_tf_layers': train_last_tf_layers,

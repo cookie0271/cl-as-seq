@@ -54,6 +54,14 @@ lora_rank_candidates: [4, 8, 16, 32, 64]
 lora_default_rank: 16
 lora_strict_match: False
 
+enable_bitfit: False
+train_bitfit: False
+bitfit_scope: transformer_only
+bitfit_include_layernorm_bias: True
+bitfit_include_head_bias: True
+bitfit_strict_match: False
+
+
 # Reproducibility
 seed: 0
 

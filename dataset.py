@@ -192,6 +192,81 @@ class MetaOmniglot(IterableDataset):
             pickle.dump(data, pickle_file)
         os.rename(self.pickle_path + '.tmp', self.pickle_path)
 
+class MetaMiniImagenet(IterableDataset):
+    data = None
+    split_classes = None
+
+    def __init__(self, config, root='./data', meta_split='train'):
+        super().__init__()
+        self.config = config
+        self.root = root
+        self.meta_split = meta_split
+        self.data_dir = path.join(root, 'mini-imagenet')
+        self.pickle_path = path.join(self.data_dir, 'mini_imagenet.pickle')
+
+        if not path.exists(self.pickle_path):
+            print('Building miniImageNet pickle...')
+            self.build_pickle()
+
+        if type(self).data is None:
+            with open(self.pickle_path, 'rb') as f, Timer('miniImageNet pickle loaded in {:.3f}s'):
+                payload = pickle.load(f)
+                type(self).data = payload['data']          # {'train': {cls: [img_bytes]}, 'test': {...}}
+                type(self).split_classes = payload['classes']
+
+        self.data = type(self).data
+        self.classes = type(self).split_classes[self.meta_split]
+
+        # decode & resize once
+        self.split_data = {}
+        for cls in self.classes:
+            cls_imgs = []
+            for img_bytes in self.data[self.meta_split][cls]:
+                img = Image.open(BytesIO(img_bytes)).convert('RGB')
+                img = img.resize((self.config['x_h'], self.config['x_w']), resample=Image.BILINEAR)
+                cls_imgs.append(pil_to_tensor(img))
+            self.split_data[cls] = cls_imgs
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        classes = random.sample(self.classes, self.config['tasks'])
+
+        train_x, train_y, test_x, test_y = [], [], [], []
+        for cls_id, cls in enumerate(classes):
+            sampled = random.sample(self.split_data[cls], self.config['train_shots'] + self.config['test_shots'])
+            train_imgs = sampled[:self.config['train_shots']]
+            test_imgs = sampled[self.config['train_shots']:]
+            train_x.extend(train_imgs)
+            train_y.extend([cls_id] * self.config['train_shots'])
+            test_x.extend(test_imgs)
+            test_y.extend([cls_id] * self.config['test_shots'])
+
+        return torch.stack(train_x), torch.tensor(train_y), torch.stack(test_x), torch.tensor(test_y)
+
+    def build_pickle(self):
+        data = {'train': {}, 'test': {}}
+        classes = {'train': [], 'test': []}
+
+        for split in ['train', 'test']:
+            split_dir = path.join(self.data_dir, split)
+            cls_names = sorted([d for d in os.listdir(split_dir) if path.isdir(path.join(split_dir, d))])
+            classes[split] = cls_names
+
+            for cls in tqdm(cls_names, desc=f'Indexing miniImageNet {split}'):
+                cls_dir = path.join(split_dir, cls)
+                img_paths = sorted(glob(path.join(cls_dir, '*')))
+                data[split][cls] = []
+                for p in img_paths:
+                    with open(p, 'rb') as f:
+                        data[split][cls].append(f.read())
+
+        payload = {'data': data, 'classes': classes}
+        with open(self.pickle_path + '.tmp', 'wb') as f:
+            pickle.dump(payload, f)
+        os.rename(self.pickle_path + '.tmp', self.pickle_path)
+
 
 class MetaCasia(IterableDataset):
     name = 'casia-hwdb'
@@ -547,6 +622,7 @@ class Sine(IterableDataset):
 DATASET = {
     'cifar100': MetaCifar100,
     'omniglot': MetaOmniglot,
+    'miniimagenet': MetaMiniImagenet,
     'casia': MetaCasia,
     'casia_comp': MetaCasiaCompletion,
     'casia_rot': MetaCasiaRotation,
