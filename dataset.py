@@ -25,7 +25,10 @@ from utils import Timer
 class MetaCifar100(IterableDataset):
     meta_train_classes = None
     meta_test_classes = None
+    class_order = None
+    split_signature = None
     data = None
+    data_np = None
 
     def __init__(self, config, root='./data', meta_split='train'):
         super().__init__()
@@ -46,14 +49,80 @@ class MetaCifar100(IterableDataset):
         # Keep an instance reference so DataLoader worker processes (which unpickle
         # dataset instances without running __init__) can still access loaded data.
         self.data = type(self).data
+        if type(self).data_np is None:
+            # Convert once to contiguous numpy arrays so worker-side episode sampling
+            # can avoid repeated Python list handling + np.stack every iteration.
+            type(self).data_np = {
+                cls: np.ascontiguousarray(np.stack(imgs, axis=0))
+                for cls, imgs in self.data.items()
+            }
+        self.data_np = type(self).data_np
 
-        if self.meta_train_classes is None:
+        # Keep an instance reference so DataLoader worker processes (which unpickle
+        # dataset instances without running __init__) can still access loaded data.
+
+        split_seed = int(config.get('cifar100_class_split_seed', 0))
+        meta_test_tasks = int(config['meta_test_tasks'])
+        meta_train_num_classes = config.get('meta_train_num_classes', None)
+        fixed_meta_test_classes = config.get('meta_test_class_ids', None)
+        use_nested_meta_train = bool(config.get('meta_train_nested_class_pool', True))
+        split_signature = (
+            split_seed,
+            meta_test_tasks,
+            tuple(fixed_meta_test_classes) if isinstance(fixed_meta_test_classes,
+                                                         (list, tuple)) else fixed_meta_test_classes,
+            int(meta_train_num_classes) if meta_train_num_classes is not None else None,
+            use_nested_meta_train,
+        )
+        if self.meta_train_classes is None or type(self).split_signature != split_signature:
             classes = list(self.data.keys())
-            random.seed(0)  # Make sure the same splits are used for all runs
-            random.shuffle(classes)
-            type(self).meta_train_classes = classes[config['meta_test_tasks']:]
-            type(self).meta_test_classes = classes[:config['meta_test_tasks']]
-            random.seed()  # Reset seed
+            split_rng = random.Random(split_seed)
+            split_rng.shuffle(classes)
+
+            if fixed_meta_test_classes is not None:
+                if not isinstance(fixed_meta_test_classes, (list, tuple)):
+                    raise ValueError('meta_test_class_ids must be a list/tuple of class ids.')
+                meta_test_classes = [int(cls) for cls in fixed_meta_test_classes]
+            else:
+                meta_test_classes = classes[:meta_test_tasks]
+
+            meta_test_set = set(meta_test_classes)
+            if len(meta_test_set) != len(meta_test_classes):
+                raise ValueError('meta_test_class_ids contains duplicate class ids.')
+            if len(meta_test_classes) != meta_test_tasks:
+                raise ValueError(
+                    f'meta_test_class_ids length ({len(meta_test_classes)}) must equal meta_test_tasks ({meta_test_tasks}).')
+            if not meta_test_set.issubset(set(classes)):
+                raise ValueError('meta_test_class_ids contains unknown CIFAR100 class ids.')
+
+            remaining = [cls for cls in classes if cls not in meta_test_set]
+            if meta_train_num_classes is None:
+                meta_train_classes = remaining
+            else:
+                meta_train_num_classes = int(meta_train_num_classes)
+                if meta_train_num_classes <= 0:
+                    raise ValueError('meta_train_num_classes must be > 0.')
+                if meta_train_num_classes > len(remaining):
+                    raise ValueError(
+                        f'meta_train_num_classes={meta_train_num_classes} exceeds available '
+                        f'meta-train class pool size={len(remaining)}.')
+                if use_nested_meta_train:
+                    meta_train_classes = remaining[:meta_train_num_classes]
+                else:
+                    meta_train_classes = split_rng.sample(remaining, meta_train_num_classes)
+
+            type(self).class_order = classes
+            type(self).meta_train_classes = meta_train_classes
+            type(self).meta_test_classes = meta_test_classes
+            type(self).split_signature = split_signature
+
+            print(
+                '[MetaCifar100] class split configured: '
+                f'seed={split_seed}, meta_test_tasks={meta_test_tasks}, '
+                f'meta_train_num_classes={len(type(self).meta_train_classes)}, '
+                f'nested_meta_train={use_nested_meta_train}')
+            print(f'[MetaCifar100] fixed meta-test classes ({len(type(self).meta_test_classes)}): '
+                  f'{type(self).meta_test_classes}')  # Reset seed
 
         if self.meta_split == 'train':
             self.classes = self.meta_train_classes
@@ -66,6 +135,10 @@ class MetaCifar100(IterableDataset):
         return self
 
     def __next__(self):
+        if len(self.classes) < self.config['tasks']:
+            raise ValueError(
+                f'Not enough classes in split={self.meta_split}: '
+                f'available={len(self.classes)} < tasks={self.config["tasks"]}.')
         classes = random.sample(self.classes, self.config['tasks'])
 
         # Sample examples for each class
@@ -73,18 +146,21 @@ class MetaCifar100(IterableDataset):
         train_y = []
         test_x = []
         test_y = []
+        total_shots = self.config['train_shots'] + self.config['test_shots']
         for cls_id, cls in enumerate(classes):
-            imgs = random.sample(self.data[cls], self.config['train_shots'] + self.config['test_shots'])
-            train_imgs = imgs[:self.config['train_shots']]
-            test_imgs = imgs[self.config['train_shots']:]
-            train_x.extend(train_imgs)
+            cls_imgs = self.data_np[cls]
+            sample_idx = np.random.choice(cls_imgs.shape[0], size=total_shots, replace=False)
+            sampled = cls_imgs[sample_idx]
+            train_imgs = sampled[:self.config['train_shots']]
+            test_imgs = sampled[self.config['train_shots']:]
+            train_x.append(train_imgs)
             train_y.extend([cls_id] * self.config['train_shots'])
-            test_x.extend(test_imgs)
+            test_x.append(test_imgs)
             test_y.extend([cls_id] * self.config['test_shots'])
 
-        train_x = torch.tensor(np.stack(train_x))
+        train_x = torch.from_numpy(np.concatenate(train_x, axis=0))
         train_y = torch.tensor(train_y)
-        test_x = torch.tensor(np.stack(test_x))
+        test_x = torch.from_numpy(np.concatenate(test_x, axis=0))
         test_y = torch.tensor(test_y)
 
         return train_x, train_y, test_x, test_y

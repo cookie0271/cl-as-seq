@@ -86,6 +86,12 @@ def load_analysis_summary(run_name: str):
 
 
 def infer_method_name(exp_name: str):
+    if exp_name.startswith('full_train'):
+        return 'full_train'
+    if exp_name.startswith('last2_only'):
+        return 'last2_only'
+    if exp_name.startswith('last2_corr_gate'):
+        return 'last2_corr_gate'
     if exp_name.startswith('bitfit_standard'):
         return 'bitfit_standard'
     if exp_name.startswith('lora_standard'):
@@ -127,7 +133,17 @@ def infer_method_name(exp_name: str):
     return 'unknown'
 
 
-def collect_rows(run_root: Path):
+def _safe_error_from_acc(acc):
+    try:
+        acc = float(acc)
+    except (TypeError, ValueError):
+        return float('nan')
+    if not math.isfinite(acc):
+        return float('nan')
+    return 1.0 - acc
+
+
+def collect_rows(run_root: Path, experiment_tag: str = ''):
     rows = []
     for log_dir in sorted(run_root.glob('*')):
         if not log_dir.is_dir():
@@ -141,12 +157,29 @@ def collect_rows(run_root: Path):
         analysis = load_analysis_summary(log_dir.name)
         trainable = load_trainable_summary(log_dir)
 
+        method_name = infer_method_name(log_dir.name)
+        acc_train = scores.get('acc/train', float('nan'))
+        acc_test = load_last_scalar_from_events(log_dir, 'acc/test')
+        meta_train_error = _safe_error_from_acc(acc_train)
+        meta_test_error = _safe_error_from_acc(acc_test)
+        meta_overfitting_gap = (
+            meta_train_error - meta_test_error
+            if math.isfinite(meta_train_error) and math.isfinite(meta_test_error)
+            else float('nan')
+        )
+
         rows.append({
             'experiment_name': log_dir.name,
-            'method_name': infer_method_name(log_dir.name),
+            'method_name': method_name,
+            'dataset': cfg.get('dataset', ''),
             'seed': cfg.get('seed', ''),
-            'acc/train': scores.get('acc/train', float('nan')),
-            'acc/test': load_last_scalar_from_events(log_dir, 'acc/test'),
+            'meta_train_num_classes': cfg.get('meta_train_num_classes', ''),
+            'meta_test_class_ids': cfg.get('meta_test_class_ids', ''),
+            'acc/train': acc_train,
+            'acc/test': acc_test,
+            'meta_train_error': meta_train_error,
+            'meta_test_error': meta_test_error,
+            'meta_overfitting_gap': meta_overfitting_gap,
             'loss/train': scores.get('loss/train', float('nan')),
             'loss/test': load_last_scalar_from_events(log_dir, 'loss/test'),
             'trainable_params': trainable.get('trainable_params', ''),
@@ -172,16 +205,17 @@ def collect_rows(run_root: Path):
             'lora_dropout': trainable.get('lora_dropout', cfg.get('lora_dropout', '')),
             'lora_layers': trainable.get('lora_layers', cfg.get('lora_layers', '')),
             'lora_target_modules': trainable.get('lora_target_modules', cfg.get('lora_target_modules', '')),
-            'lora_strict_match': trainable.get('lora_strict_match', cfg.get('lora_strict_match', cfg.get('strict_match', ''))),
+            'lora_strict_match': trainable.get('lora_strict_match',
+                                               cfg.get('lora_strict_match', cfg.get('strict_match', ''))),
             'enable_bitfit': trainable.get('enable_bitfit', cfg.get('enable_bitfit', '')),
             'train_bitfit': trainable.get('train_bitfit', cfg.get('train_bitfit', '')),
             'bitfit_scope': trainable.get('bitfit_scope', cfg.get('bitfit_scope', '')),
             'bitfit_include_layernorm_bias': trainable.get(
-            'bitfit_include_layernorm_bias', cfg.get('bitfit_include_layernorm_bias', '')),
+                'bitfit_include_layernorm_bias', cfg.get('bitfit_include_layernorm_bias', '')),
             'bitfit_include_head_bias': trainable.get(
-            'bitfit_include_head_bias', cfg.get('bitfit_include_head_bias', '')),
+                'bitfit_include_head_bias', cfg.get('bitfit_include_head_bias', '')),
             'bitfit_strict_match': trainable.get(
-            'bitfit_strict_match', cfg.get('bitfit_strict_match', cfg.get('strict_match', ''))),
+                'bitfit_strict_match', cfg.get('bitfit_strict_match', cfg.get('strict_match', ''))),
             'trainable_bias_params': trainable.get('trainable_bias_params', ''),
             'trainable_head_params': trainable.get('trainable_head_params', ''),
             'gate_bias_init': cfg.get('gate_bias_init', ''),
@@ -191,44 +225,46 @@ def collect_rows(run_root: Path):
             'mean_delta_norm': analysis.get('mean_delta_norm', float('nan')),
             'mean_h_minus_prev_norm': analysis.get('mean_h_minus_prev_norm', float('nan')),
             'log_dir': str(log_dir),
+            'experiment_tag': experiment_tag,
         })
     return rows
 
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--run-root', required=True)
+        parser.add_argument('--output', default='results/refine_ablation_12k.csv')
+        parser.add_argument('--experiment-tag', default='')
+        args = parser.parse_args()
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--run-root', required=True)
-    parser.add_argument('--output', default='results/refine_ablation_12k.csv')
-    args = parser.parse_args()
+        run_root = Path(args.run_root)
+        rows = collect_rows(run_root, experiment_tag=args.experiment_tag)
 
-    run_root = Path(args.run_root)
-    rows = collect_rows(run_root)
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fields = [
+            'experiment_name', 'experiment_tag', 'method_name', 'seed', 'dataset', 'meta_train_num_classes',
+            'meta_test_class_ids', 'max_train_steps',
+            'meta_train_error', 'meta_test_error', 'meta_overfitting_gap',
+            'acc/train', 'acc/test', 'loss/train', 'loss/test',
+            'trainable_params', 'target_trainable_params', 'trainable_param_gap', 'selected_modules',
+            'freeze_backbone', 'use_correction', 'use_highway_gate',
+            'partial_freeze_mode', 'random_match_seed', 'random_match_scope', 'random_match_unit',
+            'partial_freeze_mode', 'random_match_seed', 'random_match_scope', 'random_match_unit',
+            'enable_adapter', 'adapter_dim', 'adapter_location', 'adapter_layers', 'adapter_strict_match',
+            'gate_bias_init',
+            'enable_lora', 'lora_rank', 'lora_alpha', 'lora_dropout', 'lora_layers', 'lora_target_modules',
+            'lora_strict_match',
+            'enable_bitfit', 'train_bitfit', 'bitfit_scope', 'bitfit_include_layernorm_bias',
+            'bitfit_include_head_bias', 'bitfit_strict_match', 'trainable_bias_params', 'trainable_head_params',
+            'mean_gate', 'mean_gate_train', 'mean_gate_test', 'mean_delta_norm', 'mean_h_minus_prev_norm',
+            'log_dir',
+        ]
+        with open(output, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
 
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        'experiment_name', 'method_name', 'seed',
-        'acc/train', 'acc/test', 'loss/train', 'loss/test',
-        'trainable_params', 'target_trainable_params', 'trainable_param_gap', 'selected_modules',
-        'max_train_steps', 'freeze_backbone', 'use_correction', 'use_highway_gate',
-        'partial_freeze_mode', 'random_match_seed', 'random_match_scope', 'random_match_unit',
-        'partial_freeze_mode', 'random_match_seed', 'random_match_scope', 'random_match_unit',
-        'enable_adapter', 'adapter_dim', 'adapter_location', 'adapter_layers', 'adapter_strict_match',
-        'gate_bias_init',
-        'enable_lora', 'lora_rank', 'lora_alpha', 'lora_dropout', 'lora_layers', 'lora_target_modules',
-        'lora_strict_match',
-        'enable_bitfit', 'train_bitfit', 'bitfit_scope', 'bitfit_include_layernorm_bias',
-        'bitfit_include_head_bias', 'bitfit_strict_match', 'trainable_bias_params', 'trainable_head_params',
-        'mean_gate', 'mean_gate_train', 'mean_gate_test', 'mean_delta_norm', 'mean_h_minus_prev_norm',
-        'log_dir',
-    ]
-    with open(output, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
+        print(f'Collected {len(rows)} runs -> {output}')
 
-    print(f'Collected {len(rows)} runs -> {output}')
-
-
-if __name__ == '__main__':
-    main()
+    if __name__ == '__main__':
+        main()
