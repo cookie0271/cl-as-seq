@@ -25,10 +25,9 @@ from utils import Timer
 class MetaCifar100(IterableDataset):
     meta_train_classes = None
     meta_test_classes = None
+    data = None
     class_order = None
     split_signature = None
-    data = None
-    data_np = None
 
     def __init__(self, config, root='./data', meta_split='train'):
         super().__init__()
@@ -49,17 +48,6 @@ class MetaCifar100(IterableDataset):
         # Keep an instance reference so DataLoader worker processes (which unpickle
         # dataset instances without running __init__) can still access loaded data.
         self.data = type(self).data
-        if type(self).data_np is None:
-            # Convert once to contiguous numpy arrays so worker-side episode sampling
-            # can avoid repeated Python list handling + np.stack every iteration.
-            type(self).data_np = {
-                cls: np.ascontiguousarray(np.stack(imgs, axis=0))
-                for cls, imgs in self.data.items()
-            }
-        self.data_np = type(self).data_np
-
-        # Keep an instance reference so DataLoader worker processes (which unpickle
-        # dataset instances without running __init__) can still access loaded data.
 
         split_seed = int(config.get('cifar100_class_split_seed', 0))
         meta_test_tasks = int(config['meta_test_tasks'])
@@ -146,21 +134,18 @@ class MetaCifar100(IterableDataset):
         train_y = []
         test_x = []
         test_y = []
-        total_shots = self.config['train_shots'] + self.config['test_shots']
         for cls_id, cls in enumerate(classes):
-            cls_imgs = self.data_np[cls]
-            sample_idx = np.random.choice(cls_imgs.shape[0], size=total_shots, replace=False)
-            sampled = cls_imgs[sample_idx]
-            train_imgs = sampled[:self.config['train_shots']]
-            test_imgs = sampled[self.config['train_shots']:]
-            train_x.append(train_imgs)
+            imgs = random.sample(self.data[cls], self.config['train_shots'] + self.config['test_shots'])
+            train_imgs = imgs[:self.config['train_shots']]
+            test_imgs = imgs[self.config['train_shots']:]
+            train_x.extend(train_imgs)
             train_y.extend([cls_id] * self.config['train_shots'])
-            test_x.append(test_imgs)
+            test_x.extend(test_imgs)
             test_y.extend([cls_id] * self.config['test_shots'])
 
-        train_x = torch.from_numpy(np.concatenate(train_x, axis=0))
+        train_x = torch.tensor(np.stack(train_x))
         train_y = torch.tensor(train_y)
-        test_x = torch.from_numpy(np.concatenate(test_x, axis=0))
+        test_x = torch.tensor(np.stack(test_x))
         test_y = torch.tensor(test_y)
 
         return train_x, train_y, test_x, test_y

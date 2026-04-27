@@ -12,7 +12,7 @@ RESULTS_CSV=${RESULTS_CSV:-results/cifar100_meta_train_scale.csv}
 META_TRAIN_SCALES=${META_TRAIN_SCALES:-"20 40 60 80"}
 TARGET_STEPS=${TARGET_STEPS:-50000}
 SEEDS=${SEEDS:-"0"}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 export CUDA_VISIBLE_DEVICES
 
 TASKS=${TASKS:-20}
@@ -23,6 +23,20 @@ EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-64}
 EVAL_ITERS=${EVAL_ITERS:-32}
 NUM_WORKERS=${NUM_WORKERS:-16}
 LR=${LR:-0.0001}
+NUM_BITES=${NUM_BITES:-1}
+
+# OML / ANML use higher-order gradients in the inner loop and are usually more
+# memory-sensitive than transformer baselines. We keep per-method knobs so OML
+# can be pushed harder (better utilization) without forcing ANML to OOM.
+# Backward-compat: if old OML_ANML_* variables are set, they are used as
+# fallbacks.
+OML_BATCH_SIZE=${OML_BATCH_SIZE:-${OML_ANML_BATCH_SIZE:-128}}
+OML_EVAL_BATCH_SIZE=${OML_EVAL_BATCH_SIZE:-${OML_ANML_EVAL_BATCH_SIZE:-64}}
+OML_NUM_BITES=${OML_NUM_BITES:-${OML_ANML_NUM_BITES:-2}}
+
+ANML_BATCH_SIZE=${ANML_BATCH_SIZE:-${OML_ANML_BATCH_SIZE:-64}}
+ANML_EVAL_BATCH_SIZE=${ANML_EVAL_BATCH_SIZE:-${OML_ANML_EVAL_BATCH_SIZE:-32}}
+ANML_NUM_BITES=${ANML_NUM_BITES:-${OML_ANML_NUM_BITES:-4}}
 
 META_TEST_TASKS=${META_TEST_TASKS:-20}
 CIFAR_CLASS_SPLIT_SEED=${CIFAR_CLASS_SPLIT_SEED:-0}
@@ -31,6 +45,8 @@ META_TRAIN_NESTED_CLASS_POOL=${META_TRAIN_NESTED_CLASS_POOL:-True}
 GATE_BIAS_INIT=${GATE_BIAS_INIT:--1.0}
 GATE_DROPOUT=${GATE_DROPOUT:-0.1}
 CORR_DROPOUT=${CORR_DROPOUT:-0.1}
+
+
 
 usage() {
   cat <<USAGE
@@ -97,7 +113,7 @@ common_overrides() {
   local target_steps="$1"
   local seed="$2"
   local meta_train_num_classes="$3"
-  echo "dataset=cifar100|tasks=${TASKS}|train_shots=${TRAIN_SHOTS}|test_shots=${TEST_SHOTS}|meta_test_tasks=${META_TEST_TASKS}|meta_test_class_ids=${META_TEST_CLASS_IDS}|cifar100_class_split_seed=${CIFAR_CLASS_SPLIT_SEED}|meta_train_nested_class_pool=${META_TRAIN_NESTED_CLASS_POOL}|meta_train_num_classes=${meta_train_num_classes}|max_train_steps=${target_steps}|batch_size=${BATCH_SIZE}|eval_batch_size=${EVAL_BATCH_SIZE}|eval_iters=${EVAL_ITERS}|num_workers=${NUM_WORKERS}|summary_interval=250|eval_interval=1000|ckpt_interval=1000|optim_args.lr=${LR}|gate_bias_init=${GATE_BIAS_INIT}|gate_dropout=${GATE_DROPOUT}|corr_dropout=${CORR_DROPOUT}|dataloader_pin_memory=True|dataloader_persistent_workers=True|dataloader_prefetch_factor=4|transfer_non_blocking=True|cudnn_benchmark=True|seed=${seed}"
+  echo "dataset=cifar100|tasks=${TASKS}|train_shots=${TRAIN_SHOTS}|num_bites=${NUM_BITES}|test_shots=${TEST_SHOTS}|meta_test_tasks=${META_TEST_TASKS}|meta_test_class_ids=${META_TEST_CLASS_IDS}|cifar100_class_split_seed=${CIFAR_CLASS_SPLIT_SEED}|meta_train_nested_class_pool=${META_TRAIN_NESTED_CLASS_POOL}|meta_train_num_classes=${meta_train_num_classes}|max_train_steps=${target_steps}|batch_size=${BATCH_SIZE}|eval_batch_size=${EVAL_BATCH_SIZE}|eval_iters=${EVAL_ITERS}|num_workers=${NUM_WORKERS}|summary_interval=250|eval_interval=1000|ckpt_interval=1000|optim_args.lr=${LR}|gate_bias_init=${GATE_BIAS_INIT}|gate_dropout=${GATE_DROPOUT}|corr_dropout=${CORR_DROPOUT}|dataloader_pin_memory=True|dataloader_persistent_workers=True|dataloader_prefetch_factor=4|transfer_non_blocking=True|cudnn_benchmark=True|seed=${seed}"
 }
 
 method_settings() {
@@ -131,11 +147,11 @@ method_settings() {
       ;;
     oml)
       model_config="${OML_MODEL_CONFIG}"
-      extra=""
+      extra="batch_size=${OML_BATCH_SIZE}|eval_batch_size=${OML_EVAL_BATCH_SIZE}|num_bites=${OML_NUM_BITES}"
       ;;
     anml)
       model_config="${ANML_MODEL_CONFIG}"
-      extra=""
+      extra="batch_size=${ANML_BATCH_SIZE}|eval_batch_size=${ANML_EVAL_BATCH_SIZE}|num_bites=${ANML_NUM_BITES}"
       ;;
     *)
       echo "Unknown method: ${method}" >&2
