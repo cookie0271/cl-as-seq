@@ -265,10 +265,10 @@ class PredictionNetworkForVectorInput(nn.Module):
         logit = rearrange(logit, 'b l d -> (b l) d')
         test_y = rearrange(test_y, 'b l d -> (b l) d')
         loss = self.loss_fn(logit, test_y).mean(-1)
-        evaluation = loss.detach()
+
         loss = rearrange(loss, '(b l) -> b l 1', b=batch)
 
-        return loss, inner_lr, evaluation, logit
+        return loss, inner_lr, None, logit
 
 
 class ANML(Model):
@@ -294,7 +294,11 @@ class ANML(Model):
                 nn.Sigmoid(),
                 nn.Flatten())
             self.prediction_network = PredictionNetworkForImageInput(config)
-            self.y_encoder = ClassEncoder(config, use_embedding=False)
+
+            if config['output_type'] == 'class':
+                self.y_encoder = ClassEncoder(config, use_embedding=False)
+            else:
+                self.y_encoder = None
 
         elif config['input_type'] == 'vector':
             self.neuromodulatory_network = nn.Sequential(

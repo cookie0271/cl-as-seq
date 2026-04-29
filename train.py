@@ -85,6 +85,16 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def _optimizer_state_shapes_compatible(optim):
+    """Best-effort check that loaded optimizer slot tensors match parameter shapes."""
+    for param, state in optim.state.items():
+        if not isinstance(state, dict):
+            continue
+        for key in ('exp_avg', 'exp_avg_sq', 'max_exp_avg_sq'):
+            tensor = state.get(key, None)
+            if isinstance(tensor, torch.Tensor) and tensor.shape != param.shape:
+                return False, (key, tuple(tensor.shape), tuple(param.shape))
+    return True, None
 
 def _to_item(x):
     if x is None:
@@ -380,7 +390,14 @@ def train(rank, world_size, port, args, config, distributed=True):
             if 'optim' in ckpt:
                 try:
                     optim.load_state_dict(ckpt['optim'])
-                    optim_loaded = True
+                    compatible, mismatch = _optimizer_state_shapes_compatible(optim)
+                    if compatible:
+                        optim_loaded = True
+                    else:
+                        optim_loaded = False
+                        optim.state.clear()
+                        print('Warning: optimizer state shape mismatch after load; '
+                              f'using freshly initialized optimizer. ({mismatch})')
                 except ValueError as e:
                     print(f'Warning: optimizer state incompatible with current trainable parameter groups. '
                           f'Using freshly initialized optimizer. ({e})')

@@ -335,6 +335,7 @@ class MetaCasia(IterableDataset):
     meta_test_classes = None
     x_dict = None
     y_dict = None
+    split_signature = None
 
     def __init__(self, config, root='./data', meta_split='train'):
         super().__init__()
@@ -357,13 +358,41 @@ class MetaCasia(IterableDataset):
         self.x_dict = type(self).x_dict
         self.y_dict = type(self).y_dict
 
-        if self.meta_train_classes is None:
+        split_seed = int(config.get('split_seed', 0))
+        meta_test_tasks = int(config['meta_test_tasks'])
+        meta_train_num_classes = config.get('meta_train_num_classes', None)
+        if meta_train_num_classes is not None:
+            meta_train_num_classes = int(meta_train_num_classes)
+        split_signature = (split_seed, meta_test_tasks, meta_train_num_classes)
+
+        if self.meta_train_classes is None or type(self).split_signature != split_signature:
             classes = list(self.x_dict.keys())
-            random.seed(0)  # Make sure the same splits are used for all runs
-            random.shuffle(classes)
-            type(self).meta_train_classes = classes[config['meta_test_tasks']:]
-            type(self).meta_test_classes = classes[:config['meta_test_tasks']]
-            random.seed()  # Reset seed
+            split_rng = random.Random(split_seed)
+            split_rng.shuffle(classes)
+
+            if meta_test_tasks <= 0:
+                raise ValueError('meta_test_tasks must be > 0.')
+            if meta_test_tasks >= len(classes):
+                raise ValueError(
+                    f'meta_test_tasks={meta_test_tasks} must be < number of classes={len(classes)}.')
+
+            meta_test_classes = classes[:meta_test_tasks]
+            meta_train_candidate = classes[meta_test_tasks:]
+
+            if meta_train_num_classes is None:
+                meta_train_classes = meta_train_candidate
+            else:
+                if meta_train_num_classes <= 0:
+                    raise ValueError('meta_train_num_classes must be > 0.')
+                if meta_train_num_classes > len(meta_train_candidate):
+                    raise ValueError(
+                        f'meta_train_num_classes={meta_train_num_classes} exceeds available '
+                        f'meta-train class pool size={len(meta_train_candidate)}.')
+                meta_train_classes = meta_train_candidate[:meta_train_num_classes]
+
+            type(self).meta_train_classes = meta_train_classes
+            type(self).meta_test_classes = meta_test_classes
+            type(self).split_signature = split_signature
 
         if self.meta_split == 'train':
             self.classes = self.meta_train_classes
@@ -373,6 +402,21 @@ class MetaCasia(IterableDataset):
             raise ValueError('Unknown meta_split: {}'.format(self.meta_split))
 
         self.cache = {cls: {} for cls in self.classes}
+        self.max_images_per_class = config.get('max_images_per_class', None)
+        if self.max_images_per_class is not None:
+            self.max_images_per_class = int(self.max_images_per_class)
+            if self.max_images_per_class <= 0:
+                raise ValueError('max_images_per_class must be > 0 when specified.')
+        self.allowed_indices = {}
+        for cls in self.classes:
+            cls_imgs = self.x_dict[cls]
+            cls_indices = list(range(len(cls_imgs)))
+            if self.max_images_per_class is None or self.max_images_per_class >= len(cls_indices):
+                self.allowed_indices[cls] = cls_indices
+            else:
+                # Deterministic per-class sub-sampling for reproducibility.
+                cls_rng = random.Random(split_seed * 1000003 + int(cls))
+                self.allowed_indices[cls] = cls_rng.sample(cls_indices, self.max_images_per_class)
 
     def __iter__(self):
         return self
@@ -389,8 +433,13 @@ class MetaCasia(IterableDataset):
         for cls_id, cls in enumerate(classes):
             cls_imgs = self.x_dict[cls]
             cls_cache = self.cache[cls]
-            sampled_indices = random.sample(
-                range(len(cls_imgs)), self.config['train_shots'] + self.config['test_shots'])
+            candidate_indices = self.allowed_indices[cls]
+            required = self.config['train_shots'] + self.config['test_shots']
+            if len(candidate_indices) < required:
+                raise ValueError(
+                    f'Class {cls} has only {len(candidate_indices)} allowed images, '
+                    f'but requires train_shots + test_shots = {required}.')
+            sampled_indices = random.sample(candidate_indices, required)
 
             # Load sampled images
             imgs = []
@@ -550,8 +599,13 @@ class MetaCasiaRotation(MetaCasia):
             train_y.append(cos_sin[:self.config['train_shots']])
             test_y.append(cos_sin[self.config['train_shots']:])
 
-            sampled_indices = random.sample(
-                range(len(cls_imgs)), self.config['train_shots'] + self.config['test_shots'])
+            candidate_indices = self.allowed_indices[cls]
+            required = self.config['train_shots'] + self.config['test_shots']
+            if len(candidate_indices) < required:
+                raise ValueError(
+                    f'Class {cls} has only {len(candidate_indices)} allowed images, '
+                    f'but requires train_shots + test_shots = {required}.')
+            sampled_indices = random.sample(candidate_indices, required)
             # Load sampled images
             imgs = []
             for idx, angle in zip(sampled_indices, angles):
@@ -639,22 +693,71 @@ class MetaMsCeleb1M(MetaCasia):
 
 
 class Sine(IterableDataset):
+    task_pool = None
+    split_signature = None
     def __init__(self, config, root=None, meta_split=None):
         super().__init__()
         self.config = config
+        self.meta_split = meta_split
+        required_fields = ['x_dim', 'y_dim', 'train_shots', 'test_shots', 'tasks']
+        missing = [k for k in required_fields if k not in config]
+        if len(missing) > 0:
+            raise ValueError(f'Missing required Sine config fields: {missing}')
         self.x_t = np.linspace(0, 10, config['x_dim']).reshape(1, 1, -1)
         self.y_t = np.linspace(0, 10, config['y_dim']).reshape(1, 1, -1)
+        self.finite_pool = ('meta_train_tasks' in config) or ('meta_test_tasks' in config)
+        if self.finite_pool:
+            if meta_split not in {'train', 'test'}:
+                raise ValueError(f'Sine finite task pool requires meta_split in [train, test], got {meta_split}')
+            self.meta_train_tasks = int(config.get('meta_train_tasks', 0))
+            self.meta_test_tasks = int(config.get('meta_test_tasks', 0))
+            if self.meta_train_tasks <= 0 or self.meta_test_tasks <= 0:
+                raise ValueError('meta_train_tasks and meta_test_tasks must be > 0 for finite Sine pool.')
+            split_seed = int(config.get('split_seed', 0))
+            split_signature = (split_seed, self.meta_train_tasks, self.meta_test_tasks)
+            if type(self).task_pool is None or type(self).split_signature != split_signature:
+                total_tasks = self.meta_train_tasks + self.meta_test_tasks
+                rng = np.random.default_rng(split_seed)
+                pool = {
+                    'freq': rng.random((total_tasks, 1, 1)) + 0.1,
+                    'x_phase': rng.random((total_tasks, 1, 1)) * (2 * np.pi),
+                    'y_phase': rng.random((total_tasks, 1, 1)) * (2 * np.pi),
+                }
+                type(self).task_pool = pool
+                type(self).split_signature = split_signature
+
+            if meta_split == 'train':
+                self.task_indices = list(range(self.meta_train_tasks))
+            else:
+                self.task_indices = list(range(self.meta_train_tasks, self.meta_train_tasks + self.meta_test_tasks))
+            if len(self.task_indices) < int(config['tasks']):
+                raise ValueError(
+                    f'Not enough tasks in Sine split={meta_split}: '
+                    f'available={len(self.task_indices)} < tasks={config["tasks"]}.')
+        else:
+            self.meta_train_tasks = None
+            self.meta_test_tasks = None
+            self.task_indices = None
 
     def __iter__(self):
         return self
 
     def __next__(self):
         tasks = self.config['tasks']
-        shots = self.config['train_shots'] + self.config['test_shots']
-        freq = np.random.rand(tasks, 1, 1) + 0.1
+        if self.finite_pool:
+            sampled_task_indices = random.sample(self.task_indices, tasks)
+            sampled_task_indices = np.array(sampled_task_indices, dtype=np.int64)
+            freq = type(self).task_pool['freq'][sampled_task_indices]
+            x_phase = type(self).task_pool['x_phase'][sampled_task_indices]
+            y_phase = type(self).task_pool['y_phase'][sampled_task_indices]
+        else:
+            freq = np.random.rand(tasks, 1, 1) + 0.1
+            pi2 = 2 * np.pi
+            x_phase = np.random.rand(tasks, 1, 1) * pi2
+            y_phase = np.random.rand(tasks, 1, 1) * pi2
+
         pi2 = 2 * np.pi
-        x_phase = np.random.rand(tasks, 1, 1) * pi2
-        y_phase = np.random.rand(tasks, 1, 1) * pi2
+
         train_amp = np.random.rand(tasks, self.config['train_shots'], 1) + 0.5
         test_amp = np.random.rand(tasks, self.config['test_shots'], 1) + 0.5
 
